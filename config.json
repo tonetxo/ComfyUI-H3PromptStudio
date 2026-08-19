@@ -1,0 +1,12 @@
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "vision_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
+  "writer_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
+  "motion_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
+  "temperature_vision": 0.15,
+  "temperature_writer": 0.35,
+  "temperature_motion": 0.3,
+  "keep_alive": "0m",
+  "num_ctx": 32768,
+  "preset": "H3 Cinematic"
+}
