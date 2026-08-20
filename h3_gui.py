@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
 }
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
-PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video"]
+PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
 
 PRESETS_DATA = {
     "H3 Cinematic": {
@@ -72,18 +72,25 @@ PRESETS_DATA = {
         "audio": "Describe only audible diegetic events that correspond to visible causes.",
         "negative": "Static objects; vague 'dynamic' wording; abrupt cuts; impossible physics; random subject changes; unwanted audio.",
     },
+    "LTX Video FLF": {
+        "style": "photorealistic LTX Video first-last frame transition, crisp temporal progression, photorealistic lighting continuity",
+        "camera": "specify initial framing from First Frame, then continuous motivated camera move (dolly, pan, tilt, push-in) transitioning toward Last Frame composition",
+        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of Image 1 (FIRST_FRAME) and smoothly evolving into the pose/composition of Image 2 (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
+        "audio": "Synchronized diegetic audio matching the physical transition from start to finish.",
+        "negative": "Abrupt morphing; teleportation; frozen intermediate frames; identity drift; lighting popping; camera jumps; unwanted music; distorted limbs.",
+    },
 }
 
 VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyze the supplied reference image conservatively. Describe only what is visually supported. Do not invent story events, identities, hidden objects, future motion, or off-screen information. Return valid JSON only with keys: scene, subjects, composition, camera_in_image, environment, lighting, materials, wardrobe, props, atmosphere, visible_text, continuity_anchors, motion_candidates, ambiguities."""
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 as the primary target when selected. Preserve reference identity/composition where relevant. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
-DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
+DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
 
 
 def load_config() -> Dict[str, Any]:
@@ -370,14 +377,51 @@ def compare_history(a, b):
 def save_text(kind: str, text: str) -> str:
     out = ROOT / "outputs"
     out.mkdir(exist_ok=True)
-    path = out / ("h3_prompt.txt" if kind == "prompt" else "vision_analysis.json" if kind == "analysis" else "motion_plan.json")
+    archive = out / "archive"
+    archive.mkdir(exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base_name = "h3_prompt" if kind == "prompt" else "vision_analysis" if kind == "analysis" else "motion_plan"
+    ext = ".txt" if kind == "prompt" else ".json"
+
+    latest_path = out / f"{base_name}{ext}"
+    archive_path = archive / f"{base_name}_{timestamp}{ext}"
+
     if kind in {"analysis", "motion"}:
         try:
             text = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
         except Exception:
             pass
-    path.write_text(text or "", encoding="utf-8")
-    return str(path)
+
+    content = text or ""
+    latest_path.write_text(content, encoding="utf-8")
+    archive_path.write_text(content, encoding="utf-8")
+    return f"Saved: {latest_path.name} | Archived: archive/{archive_path.name}"
+
+
+def save_director(result):
+    if not result:
+        return "No director package to save."
+    out = ROOT / "outputs"
+    out.mkdir(exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    pkg_dir = out / "director_packages" / f"package_{timestamp}"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+
+    shots_dir = out / "director_shots"
+    shots_dir.mkdir(exist_ok=True)
+    (out / "director_sequence.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out / "reference_library.json").write_text(json.dumps(result.get("reference_library", []), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    (pkg_dir / "director_sequence.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    (pkg_dir / "reference_library.json").write_text(json.dumps(result.get("reference_library", []), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    for p in result.get("prompts", []):
+        shot_filename = f"{p['shot_id']}.txt"
+        (shots_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
+        (pkg_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
+
+    return f"Saved in outputs/ and archived in: outputs/director_packages/package_{timestamp}/"
 
 
 def apply_preset(preset):
@@ -399,7 +443,46 @@ def extract_json(text: str) -> dict:
         raise
 
 
-def director_generate(scene, reference_files, reference_labels, total_duration, shot_duration, preset, style, camera, motion, audio, dialogue, constraints,
+def extract_paths(value: Any) -> list[str]:
+    """Normalize gr.Gallery / gr.File values into a list of file paths."""
+    if value is None:
+        return []
+
+    def _get_path_from_single(item: Any) -> str | None:
+        if item is None:
+            return None
+        if isinstance(item, str):
+            return item
+        if isinstance(item, tuple):
+            return _get_path_from_single(item[0]) if len(item) > 0 else None
+        if isinstance(item, dict):
+            if "path" in item and item["path"]:
+                return item["path"]
+            if "image" in item:
+                img = item["image"]
+                p = img.get("path") if isinstance(img, dict) else img
+                return _get_path_from_single(p)
+            if "video" in item:
+                vid = item["video"]
+                p = vid.get("path") if isinstance(vid, dict) else vid
+                return _get_path_from_single(p)
+        p = getattr(item, "path", None)
+        return str(p) if p else None
+
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            p = _get_path_from_single(item)
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    single = _get_path_from_single(value)
+    return [single] if single else []
+
+
+
+def director_generate(scene, mode, reference_files, reference_labels, total_duration, shot_duration, preset, style, camera, motion, audio, dialogue, constraints,
                        ollama_url, vision_model, director_model, writer_model, tv, td, tw, num_ctx, keep_alive):
     cfg = load_config()
     # Director Mode must use exactly the models selected in the GUI.
@@ -419,13 +502,14 @@ def director_generate(scene, reference_files, reference_labels, total_duration, 
     save_config(cfg)
     if not scene.strip():
         raise ValueError("Introduce una escena para Director Mode.")
+    reference_files = extract_paths(reference_files)
     if reference_files and not vision_model:
         raise ValueError("Has cargado imágenes de referencia: selecciona un Vision model de Ollama.")
     if not director_model or not writer_model:
         raise ValueError("Selecciona Director/Planner y Writer models de Ollama.")
     total = int(total_duration); target = int(shot_duration)
-    if not 20 <= total <= 60:
-        raise ValueError("La duración total debe estar entre 20 y 60 segundos.")
+    if not 20 <= total <= 180:
+        raise ValueError("La duración total debe estar entre 20 y 180 segundos.")
     count = max(2, round(total / target))
     while count > 2 and total // count < 5:
         count -= 1
@@ -433,7 +517,7 @@ def director_generate(scene, reference_files, reference_labels, total_duration, 
     durations = [base + (1 if i < rem else 0) for i in range(count)]
     reference_library = analyze_reference_library(cfg, reference_files or [], reference_labels, tv)
     planner_input = {
-        "scene": scene, "reference_library": reference_library, "preset": preset,
+        "scene": scene, "target_workflow": mode, "reference_library": reference_library, "preset": preset,
         "global_style": style, "camera_preferences": camera, "motion_preferences": motion,
         "global_audio": audio, "dialogue": dialogue, "constraints": constraints,
         "total_duration_seconds": total, "target_shot_duration_seconds": target,
@@ -452,11 +536,11 @@ def director_generate(scene, reference_files, reference_labels, total_duration, 
     prompts = []
     for i, shot in enumerate(shots, 1):
         dur = int(shot.get("duration") or durations[min(i-1, len(durations)-1)])
-        dur = max(5, min(15, dur))
+        dur = max(5, min(30, dur))
         shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
         shot["shot_id"] = shot_id; shot["start_time"] = timeline; shot["end_time"] = timeline + dur; shot["duration"] = dur
-        payload = {"workflow":"MiniMax H3", "shot":shot, "continuity_bible":bible, "global_style":plan.get("global_style") or style,
-                   "global_audio":plan.get("global_audio") or audio, "reference_library":reference_library, "user_constraints":constraints}
+        payload = {"target_workflow": mode, "workflow_target": f"MiniMax H3 ({mode})", "shot": shot, "continuity_bible": bible, "global_style": plan.get("global_style") or style,
+                   "global_audio": plan.get("global_audio") or audio, "reference_library": reference_library, "user_constraints": constraints}
         prompt = ollama_chat(cfg, writer_model, [
             {"role":"system","content":DIRECTOR_PROMPT_SYSTEM},
             {"role":"user","content":json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -478,16 +562,6 @@ def director_prompt_text(result):
     return "\n".join(lines)
 
 
-def save_director(result):
-    out=ROOT/"outputs"; out.mkdir(exist_ok=True); shots=out/"director_shots"; shots.mkdir(exist_ok=True)
-    package=out/"director_sequence.json"; package.write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding="utf-8")
-    ref_manifest=out/"reference_library.json"; ref_manifest.write_text(json.dumps(result.get("reference_library",[]),indent=2,ensure_ascii=False),encoding="utf-8")
-    paths=[str(package), str(ref_manifest)]
-    for p in result.get("prompts",[]):
-        f=shots/f"{p['shot_id']}.txt"; f.write_text(p["prompt"],encoding="utf-8"); paths.append(str(f))
-    return "Saved:\n"+"\n".join(paths)
-
-
 def build_ui():
     cfg = load_config()
     hist = load_history()
@@ -499,7 +573,7 @@ def build_ui():
                 scene = gr.Textbox(label="Scene / intent", lines=5, placeholder="Describe what should happen in the shot…")
                 with gr.Row():
                     mode = gr.Dropdown(MODES, value="I2VA", label="Workflow")
-                    duration = gr.Dropdown(["5s", "6s", "8s", "10s", "12s", "15s"], value="10s", label="Duration")
+                    duration = gr.Dropdown(["5s", "6s", "8s", "10s", "12s", "15s", "18s", "20s", "25s", "30s"], value="10s", label="Duration")
                     aspect = gr.Dropdown(["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"], value="16:9", label="Aspect")
                 preset = gr.Dropdown(PRESETS, value=cfg.get("preset", "H3 Cinematic"), label="Cinematic preset")
                 initial_p = PRESETS_DATA.get(cfg.get("preset", "H3 Cinematic"), PRESETS_DATA["H3 Cinematic"])
@@ -534,7 +608,7 @@ def build_ui():
             with gr.Column(scale=1):
                 analysis = gr.Code(label="Vision analysis (JSON)", language="json", lines=18)
                 motion_plan = gr.Code(label="Motion Director plan (JSON)", language="json", lines=18)
-                prompt = gr.Textbox(label="Final prompt", lines=20)
+                prompt = gr.Textbox(label="Final prompt", lines=20, buttons=["copy"])
                 with gr.Row():
                     save_p = gr.Button("Save prompt")
                     save_a = gr.Button("Save analysis")
@@ -553,15 +627,19 @@ def build_ui():
                     comparison = gr.Markdown()
 
         with gr.Tab("Director Mode"):
-            gr.Markdown("## Director Mode\nPlan a 20–60 second sequence as consecutive short H3 shots with a shared continuity bible.")
+            gr.Markdown("## Director Mode\nPlan a 20–180 second sequence as consecutive short H3/LTX shots (5–30s per shot) with a shared continuity bible.")
             with gr.Row():
                 with gr.Column(scale=1):
                     d_scene = gr.Textbox(label="Scene / sequence brief", lines=7)
-                    d_refs = gr.File(label="Reference images (optional, multiple)", file_count="multiple", file_types=["image"], type="filepath")
+                    d_ref_state = gr.State([])
+                    d_file = gr.File(label="Upload / drop reference images (drop one at a time or many — they accumulate below)", file_count="multiple", file_types=["image"], type="filepath")
+                    d_refs = gr.Gallery(label="Reference images library", show_label=True, columns=4, height=200, object_fit="cover", type="filepath", interactive=True)
+                    d_clear_refs = gr.Button("Clear references", size="sm")
                     d_ref_labels = gr.Textbox(label="Reference roles / labels (optional)", lines=4, placeholder="One per line: captain.png | CHARACTER | Captain\nengine_room.jpg | LOCATION | U-29 engine room\nuniform.png | WARDROBE | Captain uniform")
                     with gr.Row():
-                        d_total = gr.Dropdown(["20","24","30","36","40","45","48","50","54","60"], value="30", label="Total duration (s)")
-                        d_shot = gr.Dropdown(["5","6","8","10","12","15"], value="8", label="Target shot duration (s)")
+                        d_mode = gr.Dropdown(MODES, value="I2VA", label="Target workflow")
+                        d_total = gr.Dropdown(["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"], value="30", label="Total duration (s)")
+                        d_shot = gr.Dropdown(["5","6","8","10","12","15","18","20","25","30"], value="8", label="Target shot duration (s)")
                     d_preset = gr.Dropdown(PRESETS, value="H3 Cinematic", label="Cinematic preset")
                     d_style = gr.Textbox(label="Global style", lines=2, value=PRESETS_DATA["H3 Cinematic"]["style"])
                     d_camera = gr.Textbox(label="Camera language", lines=2, value=PRESETS_DATA["H3 Cinematic"]["camera"])
@@ -575,10 +653,10 @@ def build_ui():
                 with gr.Column(scale=1):
                     d_bible = gr.Code(label="Continuity Bible + Reference Library", language="json", lines=22)
                     d_storyboard = gr.Code(label="Storyboard / shot plan", language="json", lines=22)
-                    d_prompts = gr.Textbox(label="All H3 shot prompts", lines=24)
+                    d_prompts = gr.Textbox(label="All H3 shot prompts", lines=24, buttons=["copy"])
                     d_status = gr.Textbox(label="Director status", interactive=False)
             d_shot_selector = gr.Dropdown(choices=[], value=None, label="Select shot", allow_custom_value=False, interactive=False)
-            d_selected_prompt = gr.Textbox(label="Selected H3 prompt", lines=14)
+            d_selected_prompt = gr.Textbox(label="Selected H3 prompt", lines=14, buttons=["copy"])
             d_selected_meta = gr.Code(label="Selected shot metadata", language="json", lines=8)
             director_state = gr.State({})
 
@@ -606,6 +684,66 @@ def build_ui():
             return gr.update(choices=[], value=None), gr.update(choices=[], value=None), gr.update(choices=[], value=None)
         delete_history.click(clear_hist, outputs=[history, compare_a, compare_b])
         d_preset.change(lambda p: apply_preset(p)[:4], inputs=d_preset, outputs=[d_style, d_camera, d_motion, d_audio])
+
+        def generate_ref_labels_text(paths: list[str], current_labels_text: str = "") -> str:
+            existing_lines_by_filename = {}
+            for line in (current_labels_text or "").splitlines():
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                parts = [x.strip() for x in line_str.split("|", 2)]
+                if parts:
+                    filename = Path(parts[0]).name.lower()
+                    existing_lines_by_filename[filename] = line_str
+
+            new_lines = []
+            is_two_file_initial = (len(paths) == 2 and not existing_lines_by_filename)
+
+            for idx, p in enumerate(paths):
+                fname = Path(p).name
+                fname_lower = fname.lower()
+                if fname_lower in existing_lines_by_filename:
+                    new_lines.append(existing_lines_by_filename[fname_lower])
+                else:
+                    stem = Path(p).stem.replace("_", " ").replace("-", " ")
+                    stem_lower = stem.lower()
+                    if is_two_file_initial:
+                        role = "FIRST_FRAME" if idx == 0 else "LAST_FRAME"
+                    elif any(k in stem_lower for k in ["char", "person", "man", "woman", "captain", "actor", "hero", "guy", "girl"]):
+                        role = "CHARACTER"
+                    elif any(k in stem_lower for k in ["loc", "room", "env", "place", "bg", "background", "stage", "city", "house", "interior", "exterior"]):
+                        role = "LOCATION"
+                    elif any(k in stem_lower for k in ["prop", "item", "object", "car", "weapon", "gun", "sword"]):
+                        role = "PROP"
+                    elif any(k in stem_lower for k in ["start", "first", "frame1", "begin"]):
+                        role = "FIRST_FRAME"
+                    elif any(k in stem_lower for k in ["end", "last", "frame2", "final"]):
+                        role = "LAST_FRAME"
+                    else:
+                        role = "GENERAL"
+                    new_lines.append(f"{fname} | {role} | {stem.capitalize()}")
+
+            return "\n".join(new_lines)
+
+        def append_d_refs(new_files, current_list, current_labels):
+            new_paths = extract_paths(new_files)
+            updated = list(current_list or [])
+            for p in new_paths:
+                if p not in updated:
+                    updated.append(p)
+            labels_text = generate_ref_labels_text(updated, current_labels)
+            return updated, updated, None, labels_text
+
+        def sync_d_refs(gal_val, current_labels):
+            remaining = extract_paths(gal_val)
+            labels_text = generate_ref_labels_text(remaining, current_labels)
+            return remaining, labels_text
+
+        d_file.upload(append_d_refs, inputs=[d_file, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
+        d_refs.upload(append_d_refs, inputs=[d_refs, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
+        d_refs.change(sync_d_refs, inputs=[d_refs, d_ref_labels], outputs=[d_ref_state, d_ref_labels])
+        d_clear_refs.click(lambda: ([], [], None, ""), outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
+
         def run_director(*args):
             ref, result = director_generate(*args)
             choices=[p["shot_id"] for p in result.get("prompts",[])]
@@ -621,7 +759,7 @@ def build_ui():
                     f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s",selector_update,
                     first.get("prompt","") if first else "",json.dumps(meta,indent=2,ensure_ascii=False),result)
         d_generate.click(run_director,
-            inputs=[d_scene,d_refs,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
+            inputs=[d_scene,d_mode,d_refs,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
                     ollama_url,vision_model,motion_model,writer_model,temperature_vision,temperature_motion,temperature_writer,num_ctx,keep_alive],
             outputs=[d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
         def show_director_shot(choice,result):
