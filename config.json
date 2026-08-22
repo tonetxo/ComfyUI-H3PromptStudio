@@ -1,12 +1,12 @@
 {
   "ollama_url": "http://127.0.0.1:11434",
-  "vision_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
-  "writer_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
-  "motion_model": "baytout3/ultragemma4-12b-heretic-uncensored:Q8_0",
+  "vision_model": "gemma4:31b-cloud",
+  "writer_model": "deepseek-v4-flash:cloud",
+  "motion_model": "minimax-m3:cloud",
   "temperature_vision": 0.15,
-  "temperature_writer": 0.35,
+  "temperature_writer": 0.45,
   "temperature_motion": 0.3,
   "keep_alive": "0m",
   "num_ctx": 32768,
-  "preset": "LTX Video"
+  "preset": "H3 Cinematic"
 }
