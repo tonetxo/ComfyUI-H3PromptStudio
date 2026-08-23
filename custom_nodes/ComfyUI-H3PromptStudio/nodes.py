@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 # Presets and System Prompts ported faithfully from H3 Prompt Studio
 MODES = ["I2VA", "FLF2VA", "T2VA", "L2VA", "R2V"]
+DURATIONS = ["5s", "6s", "8s", "10s", "12s", "15s", "18s", "20s", "25s", "30s"]
+ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "2.39:1"]
 PRESETS = [
     "H3 Cinematic",
     "H3 Dialogue",
@@ -80,7 +82,7 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
@@ -224,6 +226,25 @@ def build_writer_prompt(
     preset_data = PRESETS_DATA.get(preset, PRESETS_DATA["H3 Cinematic"])
     analysis_text = json.dumps(analysis, indent=2, ensure_ascii=False) if analysis else "NO REFERENCE IMAGE"
     motion_text = json.dumps(motion_plan, indent=2, ensure_ascii=False) if motion_plan else "NO MOTION DIRECTOR PLAN"
+    
+    # Audio instruction with automatic R2V tag injection
+    if mode == "R2V":
+        if audio and ("<Audio" in audio or "<Voice" in audio):
+            audio_text = audio
+        elif audio:
+            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio_1>."
+        else:
+            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio_1>."
+    else:
+        audio_text = audio or preset_data['audio']
+
+    r2v_requirement = ""
+    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or ""):
+        r2v_requirement = """
+CRITICAL R2V REQUIREMENT:
+This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio_1>` (or `<Audio_0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>'). If visual reference analysis is present, also reference <Image_1>. NEVER omit the <Audio_1> reference tag in the output.
+"""
+
     return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3 / Video Gen. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.
 
 USER SCENE / INTENT:
@@ -245,7 +266,7 @@ MOTION PRIORITIES:
 {motion or preset_data['motion']}
 
 AUDIO:
-{audio or preset_data['audio']}
+{audio_text}
 
 DIALOGUE:
 {dialogue or '(none unless explicitly requested)'}
@@ -255,8 +276,9 @@ CONTINUITY / CONSTRAINTS:
 
 AVOID:
 {negative or preset_data['negative']}
-
+{r2v_requirement}
 Write a coherent temporal sequence rather than a keyword list. Make important movements observable and causally connected. Keep the scene spatially consistent. Output only the final English prompt, with no markdown fences and no explanation."""
+
 
 
 # =============================================================================
@@ -273,8 +295,8 @@ class H3_PromptStudio_Unified:
                 "scene_intent": ("STRING", {"multiline": True, "default": "A character transitioning from standing still to running forwards dynamically."}),
                 "preset": (PRESETS, {"default": "H3 Cinematic"}),
                 "workflow_mode": (MODES, {"default": "I2VA"}),
-                "duration": (["5s", "10s", "15s", "20s"], {"default": "10s"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1", "4:3", "2.39:1"], {"default": "16:9"}),
+                "duration": (DURATIONS, {"default": "10s"}),
+                "aspect_ratio": (ASPECT_RATIOS, {"default": "16:9"}),
                 "enable_motion_director": ("BOOLEAN", {"default": True}),
                 "vision_model": (models, {"default": def_vision}),
                 "motion_model": (models, {"default": def_motion}),
@@ -570,7 +592,7 @@ class H3_MotionDirector:
             "required": {
                 "scene_intent": ("STRING", {"multiline": True, "default": ""}),
                 "workflow_mode": (MODES, {"default": "I2VA"}),
-                "duration": (["5s", "10s", "15s", "20s"], {"default": "10s"}),
+                "duration": (DURATIONS, {"default": "10s"}),
                 "motion_model": (models, {"default": def_motion}),
                 "temperature": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
@@ -637,8 +659,8 @@ class H3_PromptWriter:
                 "scene_intent": ("STRING", {"multiline": True, "default": ""}),
                 "preset": (PRESETS, {"default": "H3 Cinematic"}),
                 "workflow_mode": (MODES, {"default": "I2VA"}),
-                "duration": (["5s", "10s", "15s", "20s"], {"default": "10s"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1", "4:3", "2.39:1"], {"default": "16:9"}),
+                "duration": (DURATIONS, {"default": "10s"}),
+                "aspect_ratio": (ASPECT_RATIOS, {"default": "16:9"}),
                 "writer_model": (models, {"default": def_writer}),
                 "temperature": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),

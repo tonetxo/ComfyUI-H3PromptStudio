@@ -85,7 +85,7 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
@@ -282,7 +282,26 @@ def build_writer_prompt(scene: str, analysis: Optional[Dict[str, Any]], motion_p
     preset_data = PRESETS_DATA[preset]
     analysis_text = json.dumps(analysis, indent=2, ensure_ascii=False) if analysis else "NO REFERENCE IMAGE"
     motion_text = json.dumps(motion_plan, indent=2, ensure_ascii=False) if motion_plan else "NO MOTION DIRECTOR PLAN"
-    return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.\n\nUSER SCENE / INTENT:\n{scene or '(none)'}\n\nVISUAL REFERENCE ANALYSIS:\n{analysis_text}\n\nMOTION DIRECTOR PLAN:\n{motion_text}\n\nSTYLE:\n{style or preset_data['style']}\n\nCAMERA:\n{camera or preset_data['camera']}\n\nMOTION PRIORITIES:\n{motion or preset_data['motion']}\n\nAUDIO:\n{audio or preset_data['audio']}\n\nDIALOGUE:\n{dialogue or '(none unless explicitly requested)'}\n\nCONTINUITY / CONSTRAINTS:\n{constraints or '(preserve identity, wardrobe, props, geometry and lighting logic)'}\n\nAVOID:\n{negative or preset_data['negative']}\n\nWrite a coherent temporal sequence rather than a keyword list. Make important movements observable and causally connected. Keep the scene spatially consistent. Output only the final English prompt, with no markdown fences and no explanation."""
+
+    # Audio instruction with automatic R2V tag injection
+    if mode == "R2V":
+        if audio and ("<Audio" in audio or "<Voice" in audio):
+            audio_text = audio
+        elif audio:
+            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio_1>."
+        else:
+            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio_1>."
+    else:
+        audio_text = audio or preset_data['audio']
+
+    r2v_requirement = ""
+    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or ""):
+        r2v_requirement = """
+CRITICAL R2V REQUIREMENT:
+This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio_1>` (or `<Audio_0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>'). If visual reference analysis is present, also reference <Image_1>. NEVER omit the <Audio_1> reference tag in the output.
+"""
+
+    return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.\n\nUSER SCENE / INTENT:\n{scene or '(none)'}\n\nVISUAL REFERENCE ANALYSIS:\n{analysis_text}\n\nMOTION DIRECTOR PLAN:\n{motion_text}\n\nSTYLE:\n{style or preset_data['style']}\n\nCAMERA:\n{camera or preset_data['camera']}\n\nMOTION PRIORITIES:\n{motion or preset_data['motion']}\n\nAUDIO:\n{audio_text}\n\nDIALOGUE:\n{dialogue or '(none unless explicitly requested)'}\n\nCONTINUITY / CONSTRAINTS:\n{constraints or '(preserve identity, wardrobe, props, geometry and lighting logic)'}\n\nAVOID:\n{negative or preset_data['negative']}\n{r2v_requirement}\nWrite a coherent temporal sequence rather than a keyword list. Make important movements observable and causally connected. Keep the scene spatially consistent. Output only the final English prompt, with no markdown fences and no explanation."""
 
 
 def generate_prompt(cfg: Dict[str, Any], writer_prompt: str) -> str:
@@ -632,9 +651,12 @@ def build_ui():
                 with gr.Column(scale=1):
                     d_scene = gr.Textbox(label="Scene / sequence brief", lines=7)
                     d_ref_state = gr.State([])
+                    d_selected_ref_idx = gr.State(None)
                     d_file = gr.File(label="Upload / drop reference images (drop one at a time or many — they accumulate below)", file_count="multiple", file_types=["image"], type="filepath")
-                    d_refs = gr.Gallery(label="Reference images library", show_label=True, columns=4, height=200, object_fit="cover", type="filepath", interactive=True)
-                    d_clear_refs = gr.Button("Clear references", size="sm")
+                    d_refs = gr.Gallery(label="Reference images library (click an image to select and delete)", show_label=True, columns=4, height=200, object_fit="cover", type="filepath", interactive=True)
+                    with gr.Row():
+                        d_remove_selected = gr.Button("🗑️ Eliminar seleccionada", size="sm", interactive=False)
+                        d_clear_refs = gr.Button("🧹 Borrar todas las referencias", size="sm", variant="secondary")
                     d_ref_labels = gr.Textbox(label="Reference roles / labels (optional)", lines=4, placeholder="One per line: captain.png | CHARACTER | Captain\nengine_room.jpg | LOCATION | U-29 engine room\nuniform.png | WARDROBE | Captain uniform")
                     with gr.Row():
                         d_mode = gr.Dropdown(MODES, value="I2VA", label="Target workflow")
@@ -729,20 +751,33 @@ def build_ui():
             new_paths = extract_paths(new_files)
             updated = list(current_list or [])
             for p in new_paths:
-                if p not in updated:
+                if p and p not in updated:
                     updated.append(p)
             labels_text = generate_ref_labels_text(updated, current_labels)
-            return updated, updated, None, labels_text
+            return updated, updated, None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        def sync_d_refs(gal_val, current_labels):
-            remaining = extract_paths(gal_val)
-            labels_text = generate_ref_labels_text(remaining, current_labels)
-            return remaining, labels_text
+        def on_ref_selected(current_list, evt: gr.SelectData):
+            idx = evt.index
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(current_list or []):
+                fname = Path(current_list[int(idx)]).name
+                return int(idx), gr.update(interactive=True, value=f"🗑️ Eliminar '{fname}'")
+            return None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        d_file.upload(append_d_refs, inputs=[d_file, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
-        d_refs.upload(append_d_refs, inputs=[d_refs, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
-        d_refs.change(sync_d_refs, inputs=[d_refs, d_ref_labels], outputs=[d_ref_state, d_ref_labels])
-        d_clear_refs.click(lambda: ([], [], None, ""), outputs=[d_refs, d_ref_state, d_file, d_ref_labels])
+        def remove_selected_ref(selected_idx, current_list, current_labels):
+            updated = list(current_list or [])
+            if selected_idx is not None and isinstance(selected_idx, (int, float)) and 0 <= int(selected_idx) < len(updated):
+                updated.pop(int(selected_idx))
+            labels_text = generate_ref_labels_text(updated, current_labels)
+            return updated, updated, None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+
+        def clear_all_refs():
+            return [], [], None, "", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+
+        d_file.upload(append_d_refs, inputs=[d_file, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_refs.upload(append_d_refs, inputs=[d_refs, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_refs.select(on_ref_selected, inputs=[d_ref_state], outputs=[d_selected_ref_idx, d_remove_selected])
+        d_remove_selected.click(remove_selected_ref, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_clear_refs.click(clear_all_refs, outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
 
         def run_director(*args):
             ref, result = director_generate(*args)
@@ -759,7 +794,7 @@ def build_ui():
                     f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s",selector_update,
                     first.get("prompt","") if first else "",json.dumps(meta,indent=2,ensure_ascii=False),result)
         d_generate.click(run_director,
-            inputs=[d_scene,d_mode,d_refs,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
+            inputs=[d_scene,d_mode,d_ref_state,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
                     ollama_url,vision_model,motion_model,writer_model,temperature_vision,temperature_motion,temperature_writer,num_ctx,keep_alive],
             outputs=[d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
         def show_director_shot(choice,result):
