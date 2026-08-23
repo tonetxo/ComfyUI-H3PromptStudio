@@ -1,9 +1,27 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
 .venv/
-**/__pycache__/
-*.pyc
+env/
+venv/
 
+# IDEs & OS
+.idea/
+.vscode/
+*.DS_Store
 
-# Generated at runtime
-outputs/
+# Local Gradio GUI & development files (not in remote repo)
+h3_gui.py
+launch_gui.sh
+README_GUI.md
+DIRECTOR_MODE.md
+AGENTS.md
+config.json
 prompt_history.json
-# config.json holds local model selections / ollama url — keep tracked but be aware
+custom_nodes/
+outputs/
+
+# Workflows & API JSONs (local only)
+workflows/
+*.json
