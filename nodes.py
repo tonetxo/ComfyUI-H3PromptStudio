@@ -89,10 +89,33 @@ DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard p
 DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
 
 
+def sanitize_url(url: Optional[str]) -> str:
+    """Ensure URL has proper scheme and fallback to default localhost Ollama."""
+    u = (url or "").strip()
+    if not u:
+        return "http://127.0.0.1:11434"
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "http://" + u
+    return u.rstrip("/")
+
+
+def free_vram() -> None:
+    """Clean up garbage collection and flush PyTorch CUDA cache."""
+    import gc
+    gc.collect()
+    if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
 def get_ollama_models(url: str = "http://127.0.0.1:11434") -> List[str]:
     """Fetch all installed models from local Ollama instance dynamically."""
+    clean_url = sanitize_url(url)
     try:
-        r = requests.get(url.rstrip("/") + "/api/tags", timeout=3)
+        r = requests.get(clean_url + "/api/tags", timeout=3)
         if r.ok:
             models = [m.get("name", "").strip() for m in r.json().get("models", [])]
             models = sorted([m for m in models if m])
@@ -178,9 +201,10 @@ def ollama_unload_model(url: str, model: str) -> None:
     """Instruct Ollama to immediately unload a specific model from VRAM."""
     if not model:
         return
+    clean_url = sanitize_url(url)
     try:
         requests.post(
-            url.rstrip("/") + "/api/generate",
+            clean_url + "/api/generate",
             json={"model": model, "keep_alive": 0},
             timeout=5,
         )
@@ -190,13 +214,14 @@ def ollama_unload_model(url: str, model: str) -> None:
 
 def ollama_unload_all(url: str) -> None:
     """Query Ollama /api/ps and force-unload all active models to free 100% VRAM."""
+    clean_url = sanitize_url(url)
     try:
-        r = requests.get(url.rstrip("/") + "/api/ps", timeout=5)
+        r = requests.get(clean_url + "/api/ps", timeout=5)
         if r.ok:
             for item in r.json().get("models", []):
                 m_name = item.get("name") or item.get("model")
                 if m_name:
-                    ollama_unload_model(url, m_name)
+                    ollama_unload_model(clean_url, m_name)
     except Exception as e:
         print(f"[H3 Prompt Studio] Warning in ollama_unload_all: {e}")
 
@@ -211,6 +236,7 @@ def ollama_chat(
 ) -> str:
     if not model:
         raise ValueError("[H3 Prompt Studio] Model name is required.")
+    clean_url = sanitize_url(url)
     payload = {
         "model": model,
         "messages": messages,
@@ -219,9 +245,9 @@ def ollama_chat(
         "keep_alive": keep_alive,
     }
     try:
-        r = requests.post(url.rstrip("/") + "/api/chat", json=payload, timeout=900)
+        r = requests.post(clean_url + "/api/chat", json=payload, timeout=900)
     except requests.RequestException as e:
-        raise RuntimeError(f"[H3 Prompt Studio] Failed to connect to Ollama ({url}): {e}") from e
+        raise RuntimeError(f"[H3 Prompt Studio] Failed to connect to Ollama ({clean_url}): {e}") from e
     if not r.ok:
         try:
             err = r.json().get("error", r.text)
@@ -552,6 +578,7 @@ Translate the still image into visible, physically plausible motion. Include a c
         finally:
             if unload_models_after_gen:
                 ollama_unload_all(ollama_url)
+            free_vram()
 
         return (
             final_prompt,
@@ -628,6 +655,7 @@ class H3_VisionAnalyzer:
         finally:
             if unload_model and model:
                 ollama_unload_model(ollama_url, model)
+            free_vram()
 
 
 # =============================================================================
@@ -701,6 +729,7 @@ Translate the visual elements into visible, physically plausible motion. If Firs
         finally:
             if unload_model and model:
                 ollama_unload_model(ollama_url, model)
+            free_vram()
 
 
 # =============================================================================
@@ -804,6 +833,7 @@ class H3_PromptWriter:
         finally:
             if unload_model and model:
                 ollama_unload_model(ollama_url, model)
+            free_vram()
 
 
 # =============================================================================
@@ -1005,6 +1035,7 @@ class H3_DirectorMode:
         finally:
             if unload_models_after_gen:
                 ollama_unload_all(ollama_url)
+            free_vram()
 
 
 NODE_CLASS_MAPPINGS = {
