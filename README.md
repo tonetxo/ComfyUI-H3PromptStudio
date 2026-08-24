@@ -105,6 +105,7 @@ ollama pull mistral:latest
 | `writer_model` | COMBO | Dropdown populated with local Ollama text models. |
 | `first_frame_image` | IMAGE (Optional) | Starting reference image. |
 | `last_frame_image` | IMAGE (Optional) | Ending reference image for First-Last Frame (FLF) interpolation. |
+| `unload_models_after_gen` | BOOLEAN (Default: True) | Eagerly unloads vision model and purges all Ollama models from VRAM after generation to prevent CUDA OOM. |
 | `custom_*_override` | STRING (Optional) | Direct model name string or style/camera/audio overrides. |
 
 **Outputs:**

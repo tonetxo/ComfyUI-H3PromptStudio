@@ -174,13 +174,40 @@ def extract_json(text: str) -> Dict[str, Any]:
         return {"raw_text": text}
 
 
+def ollama_unload_model(url: str, model: str) -> None:
+    """Instruct Ollama to immediately unload a specific model from VRAM."""
+    if not model:
+        return
+    try:
+        requests.post(
+            url.rstrip("/") + "/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[H3 Prompt Studio] Warning unloading '{model}': {e}")
+
+
+def ollama_unload_all(url: str) -> None:
+    """Query Ollama /api/ps and force-unload all active models to free 100% VRAM."""
+    try:
+        r = requests.get(url.rstrip("/") + "/api/ps", timeout=5)
+        if r.ok:
+            for item in r.json().get("models", []):
+                m_name = item.get("name") or item.get("model")
+                if m_name:
+                    ollama_unload_model(url, m_name)
+    except Exception as e:
+        print(f"[H3 Prompt Studio] Warning in ollama_unload_all: {e}")
+
+
 def ollama_chat(
     url: str,
     model: str,
     messages: list,
     temperature: float = 0.2,
     num_ctx: int = 32768,
-    keep_alive: str = "20m",
+    keep_alive: str = "0m",
 ) -> str:
     if not model:
         raise ValueError("[H3 Prompt Studio] Model name is required.")
@@ -307,6 +334,7 @@ class H3_PromptStudio_Unified:
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
             "optional": {
+                "unload_models_after_gen": ("BOOLEAN", {"default": True}),
                 "first_frame_image": ("IMAGE",),
                 "last_frame_image": ("IMAGE",),
                 "ollama_url": ("STRING", {"default": "http://127.0.0.1:11434"}),
@@ -343,6 +371,7 @@ class H3_PromptStudio_Unified:
         temp_motion,
         temp_writer,
         num_ctx,
+        unload_models_after_gen=True,
         first_frame_image=None,
         last_frame_image=None,
         ollama_url="http://127.0.0.1:11434",
@@ -368,78 +397,85 @@ class H3_PromptStudio_Unified:
         p_data = PRESETS_DATA.get(preset, PRESETS_DATA["H3 Cinematic"])
         neg_prompt = custom_negative if custom_negative.strip() else p_data["negative"]
 
-        # Step 1: Forensic Image Analysis (Single Frame or First+Last Frame)
         analysis = None
-        b64_first = tensor_to_base64(first_frame_image)
-        b64_last = tensor_to_base64(last_frame_image)
-
-        if b64_first and b64_last:
-            # Dual Frame FLF analysis
-            msg_first = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {
-                    "role": "user",
-                    "content": "Analyze this FIRST_FRAME (Initial State) for video interpolation. Return valid JSON only.",
-                    "images": [b64_first],
-                },
-            ]
-            first_analysis = extract_json(
-                ollama_chat(ollama_url, v_model, msg_first, temp_vision, num_ctx)
-            )
-
-            msg_last = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {
-                    "role": "user",
-                    "content": "Analyze this LAST_FRAME (Target Ending State) for video interpolation. Return valid JSON only.",
-                    "images": [b64_last],
-                },
-            ]
-            last_analysis = extract_json(
-                ollama_chat(ollama_url, v_model, msg_last, temp_vision, num_ctx)
-            )
-
-            analysis = {
-                "workflow_type": "FIRST_LAST_FRAME (FLF)",
-                "first_frame_analysis": first_analysis,
-                "last_frame_analysis": last_analysis,
-            }
-
-        elif b64_first:
-            # Single Frame analysis
-            messages = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {
-                    "role": "user",
-                    "content": "Analyze this reference image. Return JSON only.",
-                    "images": [b64_first],
-                },
-            ]
-            raw_analysis = ollama_chat(
-                ollama_url, v_model, messages, temp_vision, num_ctx
-            )
-            analysis = extract_json(raw_analysis)
-
-        elif b64_last:
-            # Only last frame provided
-            messages = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {
-                    "role": "user",
-                    "content": "Analyze this target reference image. Return JSON only.",
-                    "images": [b64_last],
-                },
-            ]
-            raw_analysis = ollama_chat(
-                ollama_url, v_model, messages, temp_vision, num_ctx
-            )
-            analysis = extract_json(raw_analysis)
-
-        # Step 2: Motion Director
         motion_plan = None
-        if enable_motion_director and analysis:
+        final_prompt = ""
+
+        try:
+            # Step 1: Forensic Image Analysis (Single Frame or First+Last Frame)
+            b64_first = tensor_to_base64(first_frame_image)
+            b64_last = tensor_to_base64(last_frame_image)
+
             if b64_first and b64_last:
-                m_text = f"""FIRST-LAST FRAME (FLF) REFERENCE ANALYSIS:
+                # Dual Frame FLF analysis
+                msg_first = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": "Analyze this FIRST_FRAME (Initial State) for video interpolation. Return valid JSON only.",
+                        "images": [b64_first],
+                    },
+                ]
+                first_analysis = extract_json(
+                    ollama_chat(ollama_url, v_model, msg_first, temp_vision, num_ctx, keep_alive="0m")
+                )
+
+                msg_last = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": "Analyze this LAST_FRAME (Target Ending State) for video interpolation. Return valid JSON only.",
+                        "images": [b64_last],
+                    },
+                ]
+                last_analysis = extract_json(
+                    ollama_chat(ollama_url, v_model, msg_last, temp_vision, num_ctx, keep_alive="0m")
+                )
+
+                analysis = {
+                    "workflow_type": "FIRST_LAST_FRAME (FLF)",
+                    "first_frame_analysis": first_analysis,
+                    "last_frame_analysis": last_analysis,
+                }
+
+            elif b64_first:
+                # Single Frame analysis
+                messages = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": "Analyze this reference image. Return JSON only.",
+                        "images": [b64_first],
+                    },
+                ]
+                raw_analysis = ollama_chat(
+                    ollama_url, v_model, messages, temp_vision, num_ctx, keep_alive="0m"
+                )
+                analysis = extract_json(raw_analysis)
+
+            elif b64_last:
+                # Only last frame provided
+                messages = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": "Analyze this target reference image. Return JSON only.",
+                        "images": [b64_last],
+                    },
+                ]
+                raw_analysis = ollama_chat(
+                    ollama_url, v_model, messages, temp_vision, num_ctx, keep_alive="0m"
+                )
+                analysis = extract_json(raw_analysis)
+
+            # Eagerly unload vision model to free GPU VRAM before Motion/Writer
+            if unload_models_after_gen and (b64_first or b64_last) and v_model:
+                ollama_unload_model(ollama_url, v_model)
+
+            # Step 2: Motion Director
+            if enable_motion_director and analysis:
+                if b64_first and b64_last:
+                    m_text = f"""FIRST-LAST FRAME (FLF) REFERENCE ANALYSIS:
 FIRST_FRAME (STARTING POSE & SCENE):
 {json.dumps(analysis.get('first_frame_analysis'), indent=2, ensure_ascii=False)}
 
@@ -454,8 +490,8 @@ DURATION: {duration}
 CAMERA REQUEST: {custom_camera or '(motivate continuous camera move between both compositions)'}
 
 Translate the difference between FIRST_FRAME and LAST_FRAME into an observable, physically coherent transition trajectory. Detail the subject momentum, cloth/hair physics, intermediate actions, lighting transitions and camera motion."""
-            else:
-                m_text = f"""REFERENCE ANALYSIS:
+                else:
+                    m_text = f"""REFERENCE ANALYSIS:
 {json.dumps(analysis, indent=2, ensure_ascii=False)}
 
 USER INTENT:
@@ -467,46 +503,55 @@ CAMERA REQUEST: {custom_camera or '(choose based on reference)'}
 
 Translate the still image into visible, physically plausible motion. Include a compact temporal progression and secondary motion."""
 
-            raw_motion = ollama_chat(
-                ollama_url,
-                m_model,
-                [
-                    {"role": "system", "content": MOTION_SYSTEM},
-                    {"role": "user", "content": m_text},
-                ],
-                temp_motion,
-                num_ctx,
+                raw_motion = ollama_chat(
+                    ollama_url,
+                    m_model,
+                    [
+                        {"role": "system", "content": MOTION_SYSTEM},
+                        {"role": "user", "content": m_text},
+                    ],
+                    temp_motion,
+                    num_ctx,
+                    keep_alive="0m",
+                )
+                motion_plan = extract_json(raw_motion)
+
+                if unload_models_after_gen and m_model and m_model != w_model:
+                    ollama_unload_model(ollama_url, m_model)
+
+            # Step 3: Cinematic Prompt Writer
+            wp = build_writer_prompt(
+                scene=scene_intent,
+                analysis=analysis,
+                motion_plan=motion_plan,
+                mode=effective_mode,
+                duration=duration,
+                aspect=aspect_ratio,
+                style=custom_style,
+                camera=custom_camera,
+                motion=custom_motion,
+                audio=custom_audio,
+                dialogue=custom_dialogue,
+                constraints=custom_constraints,
+                negative=custom_negative,
+                preset=preset,
             )
-            motion_plan = extract_json(raw_motion)
 
-        # Step 3: Cinematic Prompt Writer
-        wp = build_writer_prompt(
-            scene=scene_intent,
-            analysis=analysis,
-            motion_plan=motion_plan,
-            mode=effective_mode,
-            duration=duration,
-            aspect=aspect_ratio,
-            style=custom_style,
-            camera=custom_camera,
-            motion=custom_motion,
-            audio=custom_audio,
-            dialogue=custom_dialogue,
-            constraints=custom_constraints,
-            negative=custom_negative,
-            preset=preset,
-        )
+            final_prompt = ollama_chat(
+                ollama_url,
+                w_model,
+                [
+                    {"role": "system", "content": WRITER_SYSTEM},
+                    {"role": "user", "content": wp},
+                ],
+                temp_writer,
+                num_ctx,
+                keep_alive="0m",
+            ).strip()
 
-        final_prompt = ollama_chat(
-            ollama_url,
-            w_model,
-            [
-                {"role": "system", "content": WRITER_SYSTEM},
-                {"role": "user", "content": wp},
-            ],
-            temp_writer,
-            num_ctx,
-        ).strip()
+        finally:
+            if unload_models_after_gen:
+                ollama_unload_all(ollama_url)
 
         return (
             final_prompt,
@@ -532,6 +577,7 @@ class H3_VisionAnalyzer:
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
             "optional": {
+                "unload_model": ("BOOLEAN", {"default": True}),
                 "last_frame_image": ("IMAGE",),
                 "ollama_url": ("STRING", {"default": "http://127.0.0.1:11434"}),
                 "custom_model_override": ("STRING", {"default": ""}),
@@ -543,41 +589,45 @@ class H3_VisionAnalyzer:
     FUNCTION = "analyze"
     CATEGORY = "H3_PromptStudio/Modular"
 
-    def analyze(self, first_frame_image, vision_model, temperature, num_ctx, last_frame_image=None, ollama_url="http://127.0.0.1:11434", custom_model_override=""):
+    def analyze(self, first_frame_image, vision_model, temperature, num_ctx, unload_model=True, last_frame_image=None, ollama_url="http://127.0.0.1:11434", custom_model_override=""):
         model = custom_model_override.strip() or vision_model
         b64_first = tensor_to_base64(first_frame_image)
         b64_last = tensor_to_base64(last_frame_image)
 
-        if b64_first and b64_last:
-            msg_first = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {"role": "user", "content": "Analyze FIRST_FRAME (Initial State) for video interpolation. Return JSON only.", "images": [b64_first]},
-            ]
-            first_raw = ollama_chat(ollama_url, model, msg_first, temperature, num_ctx)
+        try:
+            if b64_first and b64_last:
+                msg_first = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {"role": "user", "content": "Analyze FIRST_FRAME (Initial State) for video interpolation. Return JSON only.", "images": [b64_first]},
+                ]
+                first_raw = ollama_chat(ollama_url, model, msg_first, temperature, num_ctx, keep_alive="0m")
 
-            msg_last = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {"role": "user", "content": "Analyze LAST_FRAME (Target Ending State) for video interpolation. Return JSON only.", "images": [b64_last]},
-            ]
-            last_raw = ollama_chat(ollama_url, model, msg_last, temperature, num_ctx)
+                msg_last = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {"role": "user", "content": "Analyze LAST_FRAME (Target Ending State) for video interpolation. Return JSON only.", "images": [b64_last]},
+                ]
+                last_raw = ollama_chat(ollama_url, model, msg_last, temperature, num_ctx, keep_alive="0m")
 
-            combined = {
-                "workflow_type": "FIRST_LAST_FRAME (FLF)",
-                "first_frame_analysis": extract_json(first_raw),
-                "last_frame_analysis": extract_json(last_raw),
-            }
-            return (json.dumps(combined, indent=2, ensure_ascii=False),)
+                combined = {
+                    "workflow_type": "FIRST_LAST_FRAME (FLF)",
+                    "first_frame_analysis": extract_json(first_raw),
+                    "last_frame_analysis": extract_json(last_raw),
+                }
+                return (json.dumps(combined, indent=2, ensure_ascii=False),)
 
-        elif b64_first:
-            messages = [
-                {"role": "system", "content": VISION_SYSTEM},
-                {"role": "user", "content": "Analyze this reference image. Return JSON only.", "images": [b64_first]},
-            ]
-            raw = ollama_chat(ollama_url, model, messages, temperature, num_ctx)
-            parsed = extract_json(raw)
-            return (json.dumps(parsed, indent=2, ensure_ascii=False),)
+            elif b64_first:
+                messages = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {"role": "user", "content": "Analyze this reference image. Return JSON only.", "images": [b64_first]},
+                ]
+                raw = ollama_chat(ollama_url, model, messages, temperature, num_ctx, keep_alive="0m")
+                parsed = extract_json(raw)
+                return (json.dumps(parsed, indent=2, ensure_ascii=False),)
 
-        return ("{}",)
+            return ("{}",)
+        finally:
+            if unload_model and model:
+                ollama_unload_model(ollama_url, model)
 
 
 # =============================================================================
@@ -598,6 +648,7 @@ class H3_MotionDirector:
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
             "optional": {
+                "unload_model": ("BOOLEAN", {"default": True}),
                 "analysis_json": ("STRING", {"multiline": True, "default": "", "forceInput": True}),
                 "camera_request": ("STRING", {"default": ""}),
                 "ollama_url": ("STRING", {"default": "http://127.0.0.1:11434"}),
@@ -618,6 +669,7 @@ class H3_MotionDirector:
         motion_model,
         temperature,
         num_ctx,
+        unload_model=True,
         analysis_json="",
         camera_request="",
         ollama_url="http://127.0.0.1:11434",
@@ -635,15 +687,20 @@ DURATION: {duration}
 CAMERA REQUEST: {camera_request or '(choose based on reference)'}
 
 Translate the visual elements into visible, physically plausible motion. If First-Last Frame analysis is provided, describe the full physical transition trajectory."""
-        raw = ollama_chat(
-            ollama_url,
-            model,
-            [{"role": "system", "content": MOTION_SYSTEM}, {"role": "user", "content": text}],
-            temperature,
-            num_ctx,
-        )
-        parsed = extract_json(raw)
-        return (json.dumps(parsed, indent=2, ensure_ascii=False),)
+        try:
+            raw = ollama_chat(
+                ollama_url,
+                model,
+                [{"role": "system", "content": MOTION_SYSTEM}, {"role": "user", "content": text}],
+                temperature,
+                num_ctx,
+                keep_alive="0m",
+            )
+            parsed = extract_json(raw)
+            return (json.dumps(parsed, indent=2, ensure_ascii=False),)
+        finally:
+            if unload_model and model:
+                ollama_unload_model(ollama_url, model)
 
 
 # =============================================================================
@@ -666,6 +723,7 @@ class H3_PromptWriter:
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
             "optional": {
+                "unload_model": ("BOOLEAN", {"default": True}),
                 "analysis_json": ("STRING", {"multiline": True, "default": "", "forceInput": True}),
                 "motion_plan_json": ("STRING", {"multiline": True, "default": "", "forceInput": True}),
                 "ollama_url": ("STRING", {"default": "http://127.0.0.1:11434"}),
@@ -695,6 +753,7 @@ class H3_PromptWriter:
         writer_model,
         temperature,
         num_ctx,
+        unload_model=True,
         analysis_json="",
         motion_plan_json="",
         ollama_url="http://127.0.0.1:11434",
@@ -731,15 +790,20 @@ class H3_PromptWriter:
             preset=preset,
         )
 
-        final_prompt = ollama_chat(
-            ollama_url,
-            model,
-            [{"role": "system", "content": WRITER_SYSTEM}, {"role": "user", "content": wp}],
-            temperature,
-            num_ctx,
-        ).strip()
+        try:
+            final_prompt = ollama_chat(
+                ollama_url,
+                model,
+                [{"role": "system", "content": WRITER_SYSTEM}, {"role": "user", "content": wp}],
+                temperature,
+                num_ctx,
+                keep_alive="0m",
+            ).strip()
 
-        return (final_prompt, neg_prompt)
+            return (final_prompt, neg_prompt)
+        finally:
+            if unload_model and model:
+                ollama_unload_model(ollama_url, model)
 
 
 # =============================================================================
@@ -764,6 +828,7 @@ class H3_DirectorMode:
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
             "optional": {
+                "unload_models_after_gen": ("BOOLEAN", {"default": True}),
                 "first_frame_image": ("IMAGE",),
                 "last_frame_image": ("IMAGE",),
                 "vision_model": (models, {"default": def_vision}),
@@ -800,6 +865,7 @@ class H3_DirectorMode:
         temp_director,
         temp_writer,
         num_ctx,
+        unload_models_after_gen=True,
         first_frame_image=None,
         last_frame_image=None,
         vision_model="",
@@ -818,112 +884,127 @@ class H3_DirectorMode:
         b64_first = tensor_to_base64(first_frame_image)
         b64_last = tensor_to_base64(last_frame_image)
 
-        if b64_first and b64_last:
-            raw_v1 = ollama_chat(
-                ollama_url,
-                v_model,
-                [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze FIRST_FRAME for continuity bible. Return JSON only.", "images": [b64_first]}],
-                0.15,
-                num_ctx,
-            )
-            raw_v2 = ollama_chat(
-                ollama_url,
-                v_model,
-                [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze LAST_FRAME for continuity bible. Return JSON only.", "images": [b64_last]}],
-                0.15,
-                num_ctx,
-            )
-            ref_analysis = {
-                "first_frame": extract_json(raw_v1),
-                "last_frame": extract_json(raw_v2),
-            }
-        elif b64_first:
-            raw_v1 = ollama_chat(
-                ollama_url,
-                v_model,
-                [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze this reference image. Return JSON only.", "images": [b64_first]}],
-                0.15,
-                num_ctx,
-            )
-            ref_analysis = extract_json(raw_v1)
+        try:
+            if b64_first and b64_last:
+                raw_v1 = ollama_chat(
+                    ollama_url,
+                    v_model,
+                    [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze FIRST_FRAME for continuity bible. Return JSON only.", "images": [b64_first]}],
+                    0.15,
+                    num_ctx,
+                    keep_alive="0m",
+                )
+                raw_v2 = ollama_chat(
+                    ollama_url,
+                    v_model,
+                    [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze LAST_FRAME for continuity bible. Return JSON only.", "images": [b64_last]}],
+                    0.15,
+                    num_ctx,
+                    keep_alive="0m",
+                )
+                ref_analysis = {
+                    "first_frame": extract_json(raw_v1),
+                    "last_frame": extract_json(raw_v2),
+                }
+            elif b64_first:
+                raw_v1 = ollama_chat(
+                    ollama_url,
+                    v_model,
+                    [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze this reference image. Return JSON only.", "images": [b64_first]}],
+                    0.15,
+                    num_ctx,
+                    keep_alive="0m",
+                )
+                ref_analysis = extract_json(raw_v1)
 
-        total = int(total_duration)
-        target = int(shot_target_duration)
-        count = max(2, round(total / target))
-        while count > 2 and total // count < 5:
-            count -= 1
-        base, rem = divmod(total, count)
-        durations = [base + (1 if i < rem else 0) for i in range(count)]
+            if unload_models_after_gen and (b64_first or b64_last) and v_model:
+                ollama_unload_model(ollama_url, v_model)
 
-        planner_input = {
-            "scene": scene_script,
-            "target_workflow": workflow_mode,
-            "reference_analysis": ref_analysis,
-            "preset": preset,
-            "global_style": custom_style or PRESETS_DATA.get(preset, {}).get("style", ""),
-            "constraints": custom_constraints,
-            "total_duration_seconds": total,
-            "target_shot_duration_seconds": target,
-            "shot_count": count,
-            "shot_durations_seconds": durations,
-        }
+            total = int(total_duration)
+            target = int(shot_target_duration)
+            count = max(2, round(total / target))
+            while count > 2 and total // count < 5:
+                count -= 1
+            base, rem = divmod(total, count)
+            durations = [base + (1 if i < rem else 0) for i in range(count)]
 
-        raw_plan = ollama_chat(
-            ollama_url,
-            d_model,
-            [
-                {"role": "system", "content": DIRECTOR_SYSTEM},
-                {"role": "user", "content": json.dumps(planner_input, ensure_ascii=False, indent=2)},
-            ],
-            temp_director,
-            num_ctx,
-        )
-        plan = extract_json(raw_plan)
-        shots = plan.get("shots", [])
-        bible = plan.get("continuity_bible", {})
-
-        shot_prompts = []
-        timeline = 0
-        for i, shot in enumerate(shots, 1):
-            dur = int(shot.get("duration") or durations[min(i - 1, len(durations) - 1)])
-            shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
-            shot["shot_id"] = shot_id
-            shot["duration"] = dur
-            payload = {
+            planner_input = {
+                "scene": scene_script,
                 "target_workflow": workflow_mode,
-                "workflow_target": f"MiniMax H3 ({workflow_mode})",
-                "shot": shot,
-                "continuity_bible": bible,
-                "global_style": plan.get("global_style") or custom_style,
                 "reference_analysis": ref_analysis,
-                "user_constraints": custom_constraints,
+                "preset": preset,
+                "global_style": custom_style or PRESETS_DATA.get(preset, {}).get("style", ""),
+                "constraints": custom_constraints,
+                "total_duration_seconds": total,
+                "target_shot_duration_seconds": target,
+                "shot_count": count,
+                "shot_durations_seconds": durations,
             }
-            prompt = ollama_chat(
+
+            raw_plan = ollama_chat(
                 ollama_url,
-                w_model,
+                d_model,
                 [
-                    {"role": "system", "content": DIRECTOR_PROMPT_SYSTEM},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+                    {"role": "system", "content": DIRECTOR_SYSTEM},
+                    {"role": "user", "content": json.dumps(planner_input, ensure_ascii=False, indent=2)},
                 ],
-                temp_writer,
+                temp_director,
                 num_ctx,
-            ).strip()
-            shot_prompts.append(prompt)
-            timeline += dur
+                keep_alive="0m",
+            )
+            plan = extract_json(raw_plan)
+            shots = plan.get("shots", [])
+            bible = plan.get("continuity_bible", {})
 
-        p1 = shot_prompts[0] if len(shot_prompts) > 0 else ""
-        p2 = shot_prompts[1] if len(shot_prompts) > 1 else ""
-        p3 = shot_prompts[2] if len(shot_prompts) > 2 else ""
-        p4 = shot_prompts[3] if len(shot_prompts) > 3 else ""
+            if unload_models_after_gen and d_model and d_model != w_model:
+                ollama_unload_model(ollama_url, d_model)
 
-        return (
-            p1,
-            p2,
-            p3,
-            p4,
-            json.dumps(bible, indent=2, ensure_ascii=False),
-            json.dumps(plan, indent=2, ensure_ascii=False),
-        )
+            shot_prompts = []
+            timeline = 0
+            for i, shot in enumerate(shots, 1):
+                dur = int(shot.get("duration") or durations[min(i - 1, len(durations) - 1)])
+                shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
+                shot["shot_id"] = shot_id
+                shot["duration"] = dur
+                payload = {
+                    "target_workflow": workflow_mode,
+                    "workflow_target": f"MiniMax H3 ({workflow_mode})",
+                    "shot": shot,
+                    "continuity_bible": bible,
+                    "global_style": plan.get("global_style") or custom_style,
+                    "reference_analysis": ref_analysis,
+                    "user_constraints": custom_constraints,
+                }
+                prompt = ollama_chat(
+                    ollama_url,
+                    w_model,
+                    [
+                        {"role": "system", "content": DIRECTOR_PROMPT_SYSTEM},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+                    ],
+                    temp_writer,
+                    num_ctx,
+                    keep_alive="0m",
+                ).strip()
+                shot_prompts.append(prompt)
+                timeline += dur
+
+            p1 = shot_prompts[0] if len(shot_prompts) > 0 else ""
+            p2 = shot_prompts[1] if len(shot_prompts) > 1 else ""
+            p3 = shot_prompts[2] if len(shot_prompts) > 2 else ""
+            p4 = shot_prompts[3] if len(shot_prompts) > 3 else ""
+
+            return (
+                p1,
+                p2,
+                p3,
+                p4,
+                json.dumps(bible, indent=2, ensure_ascii=False),
+                json.dumps(plan, indent=2, ensure_ascii=False),
+            )
+        finally:
+            if unload_models_after_gen:
+                ollama_unload_all(ollama_url)
 
 
 NODE_CLASS_MAPPINGS = {
