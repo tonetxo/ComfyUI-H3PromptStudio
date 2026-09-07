@@ -82,7 +82,7 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Video_1>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
@@ -275,6 +275,7 @@ def build_writer_prompt(
     constraints: str,
     negative: str,
     preset: str,
+    custom_video: str = "",
 ) -> str:
     preset_data = PRESETS_DATA.get(preset, PRESETS_DATA["H3 Cinematic"])
     analysis_text = json.dumps(analysis, indent=2, ensure_ascii=False) if analysis else "NO REFERENCE IMAGE"
@@ -291,11 +292,26 @@ def build_writer_prompt(
     else:
         audio_text = audio or preset_data['audio']
 
+    has_video = bool(custom_video and custom_video.strip()) or ("<Video" in (scene or "")) or ("<Video" in (constraints or ""))
+    video_req = ""
+    if has_video:
+        v_note = custom_video.strip() if (custom_video and custom_video.strip()) else "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>."
+        video_req = f"- Video anchor: `<Video_1>`. You MUST explicitly embed `<Video_1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video_1>."
+
     r2v_requirement = ""
-    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or ""):
-        r2v_requirement = """
+    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or "") or has_video:
+        extra_vid = f"\n{video_req}" if has_video else ""
+        r2v_requirement = f"""
 CRITICAL R2V REQUIREMENT:
-This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio_1>` (or `<Audio_0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>'). If visual reference analysis is present, also reference <Image_1>. NEVER omit the <Audio_1> reference tag in the output.
+This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio_1>` (or `<Audio_0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>'). If visual reference analysis is present, also reference <Image_1>.{extra_vid}
+NEVER omit the reference tags in the output.
+"""
+    elif has_video:
+        r2v_requirement = f"""
+CRITICAL VIDEO REFERENCE REQUIREMENT:
+A reference video is active in this generation.
+{video_req}
+NEVER omit the `<Video_1>` tag in the final prompt.
 """
 
     return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3 / Video Gen. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.
@@ -371,6 +387,7 @@ class H3_PromptStudio_Unified:
                 "custom_camera": ("STRING", {"multiline": False, "default": ""}),
                 "custom_motion": ("STRING", {"multiline": False, "default": ""}),
                 "custom_audio": ("STRING", {"multiline": False, "default": ""}),
+                "custom_video": ("STRING", {"multiline": False, "default": ""}),
                 "custom_dialogue": ("STRING", {"multiline": False, "default": ""}),
                 "custom_constraints": ("STRING", {"multiline": False, "default": ""}),
                 "custom_negative": ("STRING", {"multiline": False, "default": ""}),
@@ -408,6 +425,7 @@ class H3_PromptStudio_Unified:
         custom_camera="",
         custom_motion="",
         custom_audio="",
+        custom_video="",
         custom_dialogue="",
         custom_constraints="",
         custom_negative="",
@@ -557,6 +575,7 @@ Translate the still image into visible, physically plausible motion. Include a c
                 camera=custom_camera,
                 motion=custom_motion,
                 audio=custom_audio,
+                custom_video=custom_video,
                 dialogue=custom_dialogue,
                 constraints=custom_constraints,
                 negative=custom_negative,
@@ -761,6 +780,7 @@ class H3_PromptWriter:
                 "custom_camera": ("STRING", {"default": ""}),
                 "custom_motion": ("STRING", {"default": ""}),
                 "custom_audio": ("STRING", {"default": ""}),
+                "custom_video": ("STRING", {"default": ""}),
                 "custom_dialogue": ("STRING", {"default": ""}),
                 "custom_constraints": ("STRING", {"default": ""}),
                 "custom_negative": ("STRING", {"default": ""}),
@@ -791,6 +811,7 @@ class H3_PromptWriter:
         custom_camera="",
         custom_motion="",
         custom_audio="",
+        custom_video="",
         custom_dialogue="",
         custom_constraints="",
         custom_negative="",
@@ -813,6 +834,7 @@ class H3_PromptWriter:
             camera=custom_camera,
             motion=custom_motion,
             audio=custom_audio,
+            custom_video=custom_video,
             dialogue=custom_dialogue,
             constraints=custom_constraints,
             negative=custom_negative,
