@@ -2249,7 +2249,7 @@ def build_ui():
         backend_sel.change(on_backend_change, inputs=backend_sel,
                            outputs=[ollama_url, vision_model, writer_model, motion_model, ollama_status])
         backend_sel.change(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel],
-                           outputs=[vision_model, writer_model, motion_model, ollama_status], trigger="change")
+                           outputs=[vision_model, writer_model, motion_model, ollama_status])
 
         # ---- Director Mode state persistence ----
         director_inputs_for_save = [
