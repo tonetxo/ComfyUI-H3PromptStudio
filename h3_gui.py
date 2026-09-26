@@ -264,14 +264,38 @@ def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+RESCAN_SCRIPT = Path("/home/tonetxo/.config/h3ps/rescan_llamacpp_models.py")
+GGUF_MODELS_DIR = Path("/home/tonetxo/gguf-models")
+
+
+def _scan_gguf_models() -> list[str]:
+    """Fallback scan of /home/tonetxo/gguf-models for .gguf files."""
+    found = []
+    if not GGUF_MODELS_DIR.exists():
+        return found
+    for subdir in sorted(GGUF_MODELS_DIR.iterdir()):
+        if not subdir.is_dir():
+            continue
+        for p in sorted(subdir.glob("*.gguf")):
+            if "mmproj" not in p.name.lower():
+                found.append(p.stem)
+    return sorted(found)
+
+
 def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
     if backend == "llamacpp":
-        r = requests.get(url.rstrip("/") + "/v1/models", timeout=5)
-        r.raise_for_status()
-        models = [m.get("id", "").strip() for m in r.json().get("data", [])]
-        # Ensure I2I alias is selectable even when the router only exposes the T2I model.
+        try:
+            r = requests.get(url.rstrip("/") + "/v1/models", timeout=5)
+            r.raise_for_status()
+            models = [m.get("id", "").strip() for m in r.json().get("data", [])]
+        except Exception:
+            models = []
+        # Ensure known fallbacks and newly-downloaded GGUFs are selectable.
         fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b", "qwen3.8-27b"]
         for m in fallback:
+            if m not in models:
+                models.append(m)
+        for m in _scan_gguf_models():
             if m not in models:
                 models.append(m)
         return sorted([m for m in models if m])
@@ -279,6 +303,32 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
     r.raise_for_status()
     models = [m.get("name", "").strip() for m in r.json().get("models", [])]
     return sorted([m for m in models if m])
+
+
+def rescan_llamacpp_models() -> str:
+    """Regenerate router preset, restart router, and wait for it to come up."""
+    try:
+        if RESCAN_SCRIPT.exists():
+            import subprocess
+            subprocess.run([sys.executable, str(RESCAN_SCRIPT)], check=True, timeout=60)
+        subprocess.run(["systemctl", "--user", "restart", "h3ps-llamacpp.service"], check=True, timeout=180)
+    except subprocess.CalledProcessError as e:
+        return f"Rescan failed: {e}"
+    except Exception as e:
+        return f"Rescan error: {e}"
+
+    # Wait for the router to become ready
+    url = "http://127.0.0.1:8080/v1/models"
+    for _ in range(40):
+        try:
+            r = requests.get(url, timeout=2)
+            if r.ok:
+                ids = [m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()]
+                return f"llama.cpp OK — {len(ids)} model(s): {', '.join(ids)}"
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return "llama.cpp router restart timed out"
 
 
 def check_ollama(url: str, backend: str = "ollama") -> str:
@@ -1892,6 +1942,7 @@ def build_ui():
                     with gr.Row():
                         refresh_models = gr.Button("Refresh models")
                         check = gr.Button("Check Ollama")
+                        rescan_btn = gr.Button("Rescan llama.cpp models", variant="secondary")
                     temperature_vision = gr.Slider(0, 1, value=ui_state.get("temperature_vision", cfg["temperature_vision"]), step=0.05, label="Vision temperature")
                     temperature_motion = gr.Slider(0, 1, value=ui_state.get("temperature_motion", cfg["temperature_motion"]), step=0.05, label="Motion temperature")
                     temperature_writer = gr.Slider(0, 1, value=ui_state.get("temperature_writer", cfg["temperature_writer"]), step=0.05, label="Writer temperature")
@@ -2029,6 +2080,11 @@ def build_ui():
         generate.click(lambda _unused: sync_compare_choices(history_choices(load_history())), inputs=prompt, outputs=[compare_a, compare_b])
         refresh_models.click(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel], outputs=[vision_model, writer_model, motion_model, ollama_status])
         check.click(check_ollama, inputs=[ollama_url, backend_sel], outputs=ollama_status)
+        rescan_btn.click(rescan_llamacpp_models, outputs=[ollama_status]).then(
+            refresh_ollama_models,
+            inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel],
+            outputs=[vision_model, writer_model, motion_model, ollama_status]
+        )
         app.load(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel], outputs=[vision_model, writer_model, motion_model, ollama_status])
         save_p.click(lambda x: save_text("prompt", x), inputs=prompt, outputs=saved)
         save_a.click(lambda x: save_text("analysis", x), inputs=analysis, outputs=saved)
