@@ -441,14 +441,20 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
     payload: Dict[str, Any] = {
         "model": model,
         "messages": _openai_messages(messages),
-        "temperature": float(temperature),
+        "temperature": 0.7,
+        "top_p": 0.80,
+        "top_k": 20,
+        "min_p": 0.0,
         "stream": False,
+        "max_tokens": 512,
         "chat_template_kwargs": {"enable_thinking": False},
-        "repeat_penalty": 1.1,
+        "presence_penalty": 1.5,
+        "frequency_penalty": 0.0,
+        "repeat_penalty": 1.0,
         "repeat_last_n": 512,
     }
     if stop:
-        payload["stop"] = [s for s in stop if s != "</think>"]
+        payload["stop"] = [s for s in stop if s != "</s>"]
     t0 = time.perf_counter()
     try:
         r = requests.post(cfg["ollama_url"].rstrip("/") + "/v1/chat/completions", json=payload, timeout=900)
