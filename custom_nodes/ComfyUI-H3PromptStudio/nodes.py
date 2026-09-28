@@ -176,12 +176,12 @@ def get_llamacpp_models(url: str = "http://127.0.0.1:8080") -> List[str]:
 
 
 def _resolve_llamacpp_model(model: str) -> str:
-    """The llama.cpp router only exposes qwen2.1-pe-t2i; map I2I aliases to it."""
+    """Normalize model aliases for llama.cpp router."""
     if not model:
         return model
     n = model.strip().lower()
     if n in ("qwen2.1-pe-i2i", "qwen2.1-pe-i2i-official"):
-        return "qwen2.1-pe-t2i"
+        return "qwen2.1-pe-i2i"
     return model
 
 

@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -115,6 +116,138 @@ ENHANCER_R2V_TASKS = [
     "video_continuation+audio_reference",
     "reference_generation+audio_reference",
 ]
+
+EVOLVE_VOCAB = [
+    "cinematic", "dramatic", "atmospheric", "moody", "ethereal", "surreal",
+    "hyperrealistic", "photorealistic", "volumetric", "noir", "neon", "golden",
+    "misty", "stormy", "serene", "tense", "epic", "intimate", "melancholic",
+    "euphoric", "ominous", "dreamlike", "futuristic", "rustic", "decayed",
+    "luxurious", "desolate", "lush", "intricate", "minimalist", "dynamic",
+    "static", "fluid", "fragmented", "seamless", "chaotic", "ordered", "warm",
+    "cold", "vibrant", "muted", "wide shot", "close up", "extreme close up",
+    "medium shot", "overhead", "low angle", "dutch angle", "tracking", "handheld",
+    "static tripod", "golden hour", "blue hour", "midday", "night", "dusk", "dawn",
+    "backlit", "rim light", "soft light", "hard light", "film grain", "lens flare",
+    "bokeh", "motion blur", "sharp focus", "shallow depth of field", "deep focus",
+    "anamorphic", "35mm", "16mm", "IMAX", "digital", "vintage", "celluloid",
+    "orchestral", "electronic", "ambient", "silence", "distant", "nearby",
+    "echoing", "muffled", "crisp", "slow motion", "time lapse", "real time",
+    "long take", "quick cut", "montage",
+]
+
+EVOLVE_SYNONYMS = {
+    "big": ["massive", "enormous", "colossal", "immense", "towering"],
+    "small": ["tiny", "minuscule", "petite", "compact", "diminutive"],
+    "fast": ["rapid", "swift", "quick", "accelerated", "hurried"],
+    "slow": ["leisurely", "gradual", "deliberate", "unhurried", "languid"],
+    "happy": ["joyful", "elated", "euphoric", "content", "radiant"],
+    "sad": ["melancholic", "somber", "mournful", "forlorn", "sorrowful"],
+    "angry": ["furious", "irate", "livid", "incensed", "wrathful"],
+    "scared": ["terrified", "petrified", "horrified", "alarmed", "panicked"],
+    "beautiful": ["gorgeous", "stunning", "breathtaking", "exquisite", "radiant"],
+    "ugly": ["grotesque", "unsightly", "repulsive", "hideous", "monstrous"],
+    "dark": ["dim", "shadowy", "murky", "tenebrous", "obscure"],
+    "light": ["luminous", "radiant", "brilliant", "gleaming", "ethereal"],
+    "old": ["ancient", "weathered", "aged", "antique", "timeworn"],
+    "new": ["pristine", "modern", "novel", "recent", "fresh"],
+    "loud": ["deafening", "thunderous", "cacophonous", "boisterous", "clamorous"],
+    "quiet": ["silent", "hushed", "muffled", "subdued", "tranquil"],
+    "hot": ["scorching", "blazing", "searing", "sweltering", "torrid"],
+    "cold": ["frigid", "freezing", "icy", "glacial", "wintry"],
+    "good": ["excellent", "superb", "magnificent", "stellar", "remarkable"],
+    "bad": ["dreadful", "abysmal", "atrocious", "deplorable", "lamentable"],
+    "run": ["sprint", "dash", "race", "bolt", "charge"],
+    "walk": ["stride", "stroll", "saunter", "march", "amble"],
+    "look": ["gaze", "stare", "glance", "peer", "behold"],
+    "say": ["whisper", "shout", "declare", "mutter", "proclaim"],
+    "make": ["craft", "forge", "construct", "assemble", "create"],
+    "break": ["shatter", "fracture", "splinter", "rupture", "demolish"],
+    "give": ["bestow", "grant", "present", "hand", "deliver"],
+    "take": ["seize", "grab", "snatch", "claim", "capture"],
+    "find": ["discover", "locate", "uncover", "detect", "unearth"],
+    "lose": ["misplace", "forfeit", "surrender", "relinquish", "abandon"],
+    "begin": ["commence", "initiate", "launch", "embark", "inaugurate"],
+    "end": ["conclude", "terminate", "cease", "finalize", "culminate"],
+    "come": ["arrive", "approach", "enter", "emerge", "appear"],
+    "go": ["depart", "leave", "exit", "vanish", "disappear"],
+    "know": ["understand", "comprehend", "grasp", "recognize", "perceive"],
+    "think": ["ponder", "contemplate", "reflect", "deliberate", "meditate"],
+    "want": ["desire", "crave", "yearn", "covet", "long for"],
+    "need": ["require", "demand", "necessitate", "warrant", "call for"],
+    "feel": ["sense", "perceive", "experience", "detect", "intuit"],
+    "see": ["observe", "witness", "behold", "discern", "sight"],
+    "hear": ["perceive", "detect", "listen", "catch", "make out"],
+    "love": ["adore", "cherish", "treasure", "revere", "idolize"],
+    "hate": ["despise", "loathe", "abhor", "detest", "execrate"],
+}
+
+_WORD_RE = re.compile(r"[a-zA-Z]+")
+
+
+def _evolve_replace(token: str, strength: int, repl: str) -> str:
+    if not _WORD_RE.fullmatch(token) or random.random() * 100 >= strength:
+        return token
+    if token[0].isupper():
+        return repl.capitalize()
+    return repl
+
+
+def evolve_words(prompt: str, strength: int) -> str:
+    parts = re.split(r"(\b)", prompt)
+    return "".join(
+        _evolve_replace(p, strength, random.choice(EVOLVE_VOCAB))
+        if _WORD_RE.fullmatch(p) else p
+        for p in parts
+    )
+
+
+def evolve_internal(prompt: str, strength: int) -> str:
+    raw_words = _WORD_RE.findall(prompt)
+    if len(raw_words) < 2:
+        return prompt
+    parts = re.split(r"(\b)", prompt)
+    return "".join(
+        _evolve_replace(p, strength, random.choice(raw_words))
+        if _WORD_RE.fullmatch(p) else p
+        for p in parts
+    )
+
+
+def evolve_synonyms(prompt: str, strength: int) -> str:
+    parts = re.split(r"(\b)", prompt)
+    out = []
+    for p in parts:
+        lower = p.lower()
+        syns = EVOLVE_SYNONYMS.get(lower)
+        if not syns or random.random() * 100 >= strength:
+            out.append(p)
+        else:
+            out.append(_evolve_replace(p, strength, random.choice(syns)))
+    return "".join(out)
+
+
+def generate_evolved(prompt: str, mode: str, strength: int, count: int, seed: int) -> str:
+    if not prompt.strip():
+        return ""
+    base_seed = hash((int(seed), mode, prompt.strip()))
+    variants = []
+    for i in range(int(count)):
+        random.seed(base_seed + i)
+        if mode == "words":
+            v = evolve_words(prompt, strength)
+        elif mode == "internal":
+            v = evolve_internal(prompt, strength)
+        else:
+            v = evolve_synonyms(prompt, strength)
+        variants.append(" ".join(v.split()))
+    return "\n\n".join(f"--- Variant {i + 1} ---\n{v}" for i, v in enumerate(variants))
+
+
+def extract_first_variant(evolved_text: str) -> str:
+    blocks = re.split(r"--- Variant \d+ ---", evolved_text.strip())
+    if len(blocks) > 1:
+        return blocks[1].strip()
+    return evolved_text.strip()
 
 ENHANCER_SYSTEM_T2VA = """You enhance rough video prompts into structured audiovisual rewrite prompts for T2VA (text-only, no reference pictures).
 
@@ -420,12 +553,12 @@ def _openai_messages(messages: list) -> list:
 
 
 def _resolve_llamacpp_model(model: str) -> str:
-    """The llama.cpp router only exposes qwen2.1-pe-t2i; map I2I aliases to it."""
+    """Normalize model aliases for llama.cpp router."""
     if not model:
         return model
     n = model.strip().lower()
     if n in ("qwen2.1-pe-i2i", "qwen2.1-pe-i2i-official"):
-        return "qwen2.1-pe-t2i"
+        return "qwen2.1-pe-i2i"
     return model
 
 
@@ -1294,6 +1427,7 @@ UI_STATE_FIELDS = [
     "backend", "ollama_url", "vision_model", "motion_model", "writer_model",
     "temperature_vision", "temperature_motion", "temperature_writer", "num_ctx", "keep_alive",
     "analysis", "motion_plan", "prompt", "timing_display",
+    "evolve_mode", "evolve_strength", "evolve_count", "evolve_seed",
 ]
 
 DIRECTOR_UI_STATE_FIELDS = [
@@ -1965,6 +2099,39 @@ def build_ui():
                     save_p = gr.Button("Save prompt")
                     save_a = gr.Button("Save analysis")
                     save_m = gr.Button("Save motion plan")
+
+                with gr.Accordion("Evolve / Prompt Transmuter", open=False):
+                    evolve_mode = gr.Dropdown(
+                        choices=["words", "internal", "synonyms"],
+                        value=ui_state.get("evolve_mode", "words"),
+                        label="Mode",
+                    )
+                    evolve_mode_info = gr.Markdown(
+                        "**Words**: cinematic vocabulary injection · **Words from prompt**: reuse words already in the prompt · **Cinematic synonyms**: synonym substitution"
+                    )
+                    evolve_strength = gr.Slider(
+                        minimum=0, maximum=100, step=1, value=ui_state.get("evolve_strength", 10),
+                        label="Probability (% of tokens changed)",
+                    )
+                    with gr.Row():
+                        evolve_count = gr.Number(
+                            value=ui_state.get("evolve_count", 4), minimum=1, maximum=16, precision=0,
+                            label="Variants",
+                        )
+                        evolve_seed = gr.Number(
+                            value=ui_state.get("evolve_seed", 42), precision=0, label="Seed",
+                        )
+                    with gr.Row():
+                        btn_evolve = gr.Button("Transmute", variant="primary")
+                        btn_evolve_copy = gr.Button("Copy")
+                        btn_evolve_send = gr.Button("Send to Scene", variant="secondary")
+                    evolve_output = gr.Textbox(
+                        label="Variants",
+                        lines=10,
+                        placeholder="Variants will appear here…",
+                        interactive=False,
+                    )
+
                 saved = gr.Textbox(label="Saved file", interactive=False)
 
                 with gr.Accordion("Prompt history / versions", open=False):
@@ -2095,6 +2262,26 @@ def build_ui():
         save_p.click(lambda x: save_text("prompt", x), inputs=prompt, outputs=saved)
         save_a.click(lambda x: save_text("analysis", x), inputs=analysis, outputs=saved)
         save_m.click(lambda x: save_text("motion", x), inputs=motion_plan, outputs=saved)
+
+        btn_evolve.click(
+            generate_evolved,
+            inputs=[scene, evolve_mode, evolve_strength, evolve_count, evolve_seed],
+            outputs=evolve_output,
+        )
+        btn_evolve_send.click(
+            extract_first_variant,
+            inputs=evolve_output,
+            outputs=scene,
+        )
+        evolve_copy_js = """
+        (text) => {
+            if (!text) return "";
+            navigator.clipboard.writeText(text).then(() => {}, () => {});
+            return text;
+        }
+        """
+        btn_evolve_copy.click(None, inputs=evolve_output, outputs=evolve_output, js=evolve_copy_js)
+
         restore.click(restore_history, inputs=history,
             outputs=[scene, prompt, analysis, mode, duration, aspect, preset, style, camera, motion, audio, dialogue, constraints, motion_enabled, motion_plan, title, timing_display])
         compare.click(compare_history, inputs=[compare_a, compare_b], outputs=comparison)
@@ -2233,6 +2420,7 @@ def build_ui():
             scene, mode, duration, aspect, preset, style, camera, motion, audio, dialogue, constraints,
             negative, motion_enabled, title, backend_sel, ollama_url, vision_model, writer_model, motion_model,
             temperature_vision, temperature_motion, temperature_writer, num_ctx, keep_alive, r2v_task,
+            evolve_mode, evolve_strength, evolve_count, evolve_seed,
         ]
         def _make_main_state_dict(*args):
             return {
@@ -2245,6 +2433,7 @@ def build_ui():
                 "motion_model": args[25],
                 "temperature_vision": args[26], "temperature_motion": args[27], "temperature_writer": args[28],
                 "num_ctx": args[29], "keep_alive": args[30], "r2v_task": args[31],
+                "evolve_mode": args[32], "evolve_strength": args[33], "evolve_count": args[34], "evolve_seed": args[35],
             }
         def _save_main_from_inputs(*args):
             save_main_ui_state(_make_main_state_dict(*args))
@@ -2289,7 +2478,8 @@ def build_ui():
         # Text / dropdown / slider listeners.
         for comp in (scene, mode, duration, aspect, preset, style, camera, motion, audio, dialogue,
                      constraints, negative, motion_enabled, title, ollama_url, backend_sel,
-                     temperature_vision, temperature_motion, temperature_writer, num_ctx, keep_alive, r2v_task):
+                     temperature_vision, temperature_motion, temperature_writer, num_ctx, keep_alive, r2v_task,
+                     evolve_mode, evolve_strength, evolve_count, evolve_seed):
             try:
                 comp.change(_save_main_from_inputs, inputs=main_inputs_for_save)
             except Exception:
