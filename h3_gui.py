@@ -562,7 +562,7 @@ def _resolve_llamacpp_model(model: str) -> str:
     return model
 
 
-def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None, stop: Optional[list] = None) -> str:
+def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None, stop: Optional[list] = None, max_tokens: Optional[int] = None) -> str:
     """llama.cpp router via OpenAI-compatible /v1/chat/completions.
 
     Thinking is disabled with chat_template_kwargs; VRAM release is the server's
@@ -571,17 +571,19 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
     model = _resolve_llamacpp_model(model)
     if not model:
         raise ValueError("No model selected.")
+    if max_tokens is None:
+        max_tokens = int(cfg.get("max_tokens") or 4096)
     payload: Dict[str, Any] = {
         "model": model,
         "messages": _openai_messages(messages),
-        "temperature": 0.7,
-        "top_p": 0.80,
-        "top_k": 20,
+        "temperature": float(temperature),
+        "top_p": 0.90,
+        "top_k": 40,
         "min_p": 0.0,
         "stream": False,
-        "max_tokens": 512,
+        "max_tokens": max_tokens,
         "chat_template_kwargs": {"enable_thinking": False},
-        "presence_penalty": 1.5,
+        "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
         "repeat_penalty": 1.0,
         "repeat_last_n": 512,
@@ -621,11 +623,11 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
         raise RuntimeError(f"Respuesta inesperada de llama.cpp para '{model}': {r.text[:1000]}") from e
 
 
-def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None) -> str:
+def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None, max_tokens: Optional[int] = None) -> str:
     if not model:
         raise ValueError("No model selected.")
     if cfg.get("backend") == "llamacpp":
-        return llamacpp_chat_completion(cfg, model, messages, temperature, track_stats)
+        return llamacpp_chat_completion(cfg, model, messages, temperature, track_stats, max_tokens=max_tokens)
     payload = {
         "model": model,
         "messages": messages,
@@ -1938,10 +1940,11 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
         {"role":"user","content":json.dumps(planner_input, ensure_ascii=False, indent=2)}
-    ], td)
+    ], td, max_tokens=4096)
     plan = extract_json(raw_plan)
     shots = plan.get("shots", [])
     if not shots:
+        print(f"[Director] Error: No shots parsed. Raw output (len={len(raw_plan)}):\n{raw_plan[:800]}")
         raise ValueError("Director model no devolvió ningún plano.")
     bible = plan.get("continuity_bible", {})
     timeline = 0
@@ -1956,7 +1959,7 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
         prompt = ollama_chat(cfg, writer_model, [
             {"role":"system","content":DIRECTOR_PROMPT_SYSTEM},
             {"role":"user","content":json.dumps(payload, ensure_ascii=False, indent=2)}
-        ], tw).strip()
+        ], tw, max_tokens=4096).strip()
         prompts.append({"shot_id":shot_id,"start_time":timeline,"end_time":timeline+dur,"duration":dur,"prompt":prompt})
         timeline += dur
     result = {"project_title":plan.get("project_title") or "Director Mode sequence", "total_duration":timeline,
