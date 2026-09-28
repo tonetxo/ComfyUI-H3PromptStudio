@@ -1292,7 +1292,7 @@ def parse_reference_labels(text: str, paths: list[str]) -> list[dict]:
     return entries
 
 
-def analyze_reference_library(cfg: Dict[str, Any], paths: list[str], labels: str, temperature: float) -> list[dict]:
+def analyze_reference_library(cfg: Dict[str, Any], paths: list[str], labels: str, temperature: float, track_stats: Optional[list] = None) -> list[dict]:
     refs = parse_reference_labels(labels, paths)
     if not refs:
         return []
@@ -1308,7 +1308,7 @@ def analyze_reference_library(cfg: Dict[str, Any], paths: list[str], labels: str
         raw = ollama_chat(cfg, model, [
             {"role": "system", "content": VISION_SYSTEM},
             {"role": "user", "content": prompt, "images": [image_to_b64(ref["path"])]},
-        ], temperature)
+        ], temperature, track_stats=track_stats)
         analysis = extract_json(raw)
         out.append({"reference_id": ref["reference_id"], "filename": ref["filename"], "role": ref["role"], "label": ref["label"], "analysis": analysis})
     return out
@@ -1436,7 +1436,7 @@ DIRECTOR_UI_STATE_FIELDS = [
     "d_scene", "d_ref_state", "d_ref_labels",
     "d_mode", "d_total", "d_shot", "d_preset",
     "d_style", "d_camera", "d_motion", "d_audio", "d_dialogue", "d_constraints",
-    "director_state", "d_bible", "d_storyboard", "d_prompts", "d_status",
+    "director_state", "d_bible", "d_storyboard", "d_prompts", "d_status", "d_timing_display",
 ]
 
 
@@ -1546,7 +1546,8 @@ def format_timing_badge(timings: Dict[str, Any], enhancer_fallback: bool = False
     if m_time and m_time > 0:
         m_speed = timings.get("motion_tok_s", 0)
         speed_str = f" · *{m_speed:.1f} tok/s*" if m_speed else ""
-        parts.append(f"🎬 **Motion:** `{m_model}` **{m_time:.2f}s**{speed_str}")
+        stage_name = "Director" if timings.get("is_director") else "Motion"
+        parts.append(f"🎬 **{stage_name}:** `{m_model}` **{m_time:.2f}s**{speed_str}")
 
     w_time = timings.get("writer_s", 0)
     w_model = timings.get("writer_model", "")
@@ -1554,7 +1555,9 @@ def format_timing_badge(timings: Dict[str, Any], enhancer_fallback: bool = False
         w_speed = timings.get("writer_tok_s", 0)
         speed_str = f" · *{w_speed:.1f} tok/s*" if w_speed else ""
         fallback_note = " · ⚠️ *fallback genérico*" if enhancer_fallback else ""
-        parts.append(f"✍️ **Writer:** `{w_model}` **{w_time:.2f}s**{speed_str}{fallback_note}")
+        shot_count = timings.get("shot_count")
+        shots_str = f" *({shot_count} planos)*" if shot_count else ""
+        parts.append(f"✍️ **Writer:** `{w_model}`{shots_str} **{w_time:.2f}s**{speed_str}{fallback_note}")
 
     stages = " &nbsp;│&nbsp; ".join(parts) if parts else ""
     return f"⏱️ **Tiempo Total:** `{tot:.2f}s` &nbsp;│&nbsp; {stages}" if stages else f"⏱️ **Tiempo Total:** `{tot:.2f}s`"
@@ -1929,7 +1932,14 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
         count -= 1
     base, rem = divmod(total, count)
     durations = [base + (1 if i < rem else 0) for i in range(count)]
-    reference_library = analyze_reference_library(cfg, reference_files or [], reference_labels, tv)
+
+    stats_log = []
+    t_total_start = time.perf_counter()
+
+    t_v_start = time.perf_counter()
+    reference_library = analyze_reference_library(cfg, reference_files or [], reference_labels, tv, track_stats=stats_log)
+    t_vision = time.perf_counter() - t_v_start if reference_files else 0.0
+
     planner_input = {
         "scene": scene, "target_workflow": mode, "reference_library": reference_library, "preset": preset,
         "global_style": style, "camera_preferences": camera, "motion_preferences": motion,
@@ -1937,10 +1947,13 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
         "total_duration_seconds": total, "target_shot_duration_seconds": target,
         "shot_count": count, "shot_durations_seconds": durations
     }
+    t_d_start = time.perf_counter()
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
         {"role":"user","content":json.dumps(planner_input, ensure_ascii=False, indent=2)}
-    ], td, max_tokens=4096)
+    ], td, track_stats=stats_log, max_tokens=4096)
+    t_director = time.perf_counter() - t_d_start
+
     plan = extract_json(raw_plan)
     shots = plan.get("shots", [])
     if not shots:
@@ -1949,23 +1962,56 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     bible = plan.get("continuity_bible", {})
     timeline = 0
     prompts = []
+    t_w_start = time.perf_counter()
     for i, shot in enumerate(shots, 1):
         dur = int(shot.get("duration") or durations[min(i-1, len(durations)-1)])
         dur = max(5, min(30, dur))
-        shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
+        shot_id = str(shot.get("shot_id") or f"SHOT_{i:02d}")
         shot["shot_id"] = shot_id; shot["start_time"] = timeline; shot["end_time"] = timeline + dur; shot["duration"] = dur
         payload = {"target_workflow": mode, "workflow_target": f"MiniMax H3 ({mode})", "shot": shot, "continuity_bible": bible, "global_style": plan.get("global_style") or style,
                    "global_audio": plan.get("global_audio") or audio, "reference_library": reference_library, "user_constraints": constraints}
         prompt = ollama_chat(cfg, writer_model, [
             {"role":"system","content":DIRECTOR_PROMPT_SYSTEM},
             {"role":"user","content":json.dumps(payload, ensure_ascii=False, indent=2)}
-        ], tw, max_tokens=4096).strip()
+        ], tw, track_stats=stats_log, max_tokens=4096).strip()
         prompts.append({"shot_id":shot_id,"start_time":timeline,"end_time":timeline+dur,"duration":dur,"prompt":prompt})
         timeline += dur
+    t_writer = time.perf_counter() - t_w_start
+
+    t_total = time.perf_counter() - t_total_start
+
+    w_tokens = sum(s.get("eval_count", 0) for s in stats_log if s["model"] == writer_model)
+    w_eval_dur = sum(s.get("eval_duration_s", 0) for s in stats_log if s["model"] == writer_model)
+    writer_speed = round(w_tokens / w_eval_dur, 1) if (w_tokens and w_eval_dur > 0) else next((s["tokens_per_second"] for s in reversed(stats_log) if s["model"] == writer_model), 0)
+
+    v_tokens = sum(s.get("eval_count", 0) for s in stats_log if s["model"] == vision_model)
+    v_eval_dur = sum(s.get("eval_duration_s", 0) for s in stats_log if s["model"] == vision_model)
+    vision_speed = round(v_tokens / v_eval_dur, 1) if (v_tokens and v_eval_dur > 0) else (next((s["tokens_per_second"] for s in stats_log if s["model"] == vision_model), 0) if reference_files else 0)
+
+    director_speed = next((s["tokens_per_second"] for s in stats_log if s["model"] == director_model), 0)
+
+    timings = {
+        "is_director": True,
+        "total_s": round(t_total, 2),
+        "vision_s": round(t_vision, 2),
+        "motion_s": round(t_director, 2),
+        "writer_s": round(t_writer, 2),
+        "vision_model": vision_model if reference_files else "",
+        "motion_model": director_model,
+        "writer_model": writer_model,
+        "writer_tok_s": writer_speed,
+        "vision_tok_s": vision_speed,
+        "motion_tok_s": director_speed,
+        "shot_count": len(prompts),
+    }
+
+    if keep_alive == "0m":
+        ollama_unload_all(cfg["ollama_url"])
+
     result = {"project_title":plan.get("project_title") or "Director Mode sequence", "total_duration":timeline,
               "shot_count":len(prompts), "continuity_bible":bible, "global_style":plan.get("global_style") or style,
-              "global_audio":plan.get("global_audio") or audio, "storyboard":shots, "prompts":prompts}
-    result["reference_library"] = reference_library
+              "global_audio":plan.get("global_audio") or audio, "storyboard":shots, "prompts":prompts,
+              "reference_library": reference_library, "timings": timings}
     return reference_library, result
 
 
@@ -2178,13 +2224,21 @@ def build_ui():
                     d_export = gr.Button("Save Director package")
                     d_saved = gr.Textbox(label="Saved files", interactive=False)
                 with gr.Column(scale=1):
+                    d_timing_display = gr.Markdown(value=ui_state.get("d_timing_display", "⏱️ **Tiempos de ejecución:** *(Aún no se ha generado ninguna secuencia)*"))
                     d_bible = gr.Code(label="Continuity Bible + Reference Library", language="json", lines=22, value=ui_state.get("d_bible", ""))
                     d_storyboard = gr.Code(label="Storyboard / shot plan", language="json", lines=22, value=ui_state.get("d_storyboard", ""))
                     d_prompts = gr.Textbox(label="All H3 shot prompts", lines=24, value=ui_state.get("d_prompts", ""), buttons=["copy"])
                     d_status = gr.Textbox(label="Director status", value=ui_state.get("d_status", ""), interactive=False)
-            d_shot_selector = gr.Dropdown(choices=[], value=None, label="Select shot", allow_custom_value=False, interactive=False)
-            d_selected_prompt = gr.Textbox(label="Selected H3 prompt", lines=14, buttons=["copy"])
-            d_selected_meta = gr.Code(label="Selected shot metadata", language="json", lines=8)
+            saved_d_state = ui_state.get("director_state") or {}
+            saved_d_prompts = saved_d_state.get("prompts", []) if isinstance(saved_d_state, dict) else []
+            saved_d_choices = [str(p.get("shot_id") or f"SHOT_{idx:02d}") for idx, p in enumerate(saved_d_prompts, 1)]
+            saved_d_val = saved_d_choices[0] if saved_d_choices else None
+            saved_d_first_prompt = saved_d_prompts[0].get("prompt", "") if saved_d_prompts else ""
+            saved_d_meta = {k: saved_d_prompts[0].get(k) for k in ["shot_id", "start_time", "end_time", "duration"]} if saved_d_prompts else {}
+
+            d_shot_selector = gr.Dropdown(choices=saved_d_choices, value=saved_d_val, label="Select shot", allow_custom_value=False, interactive=bool(saved_d_choices))
+            d_selected_prompt = gr.Textbox(label="Selected H3 prompt", lines=14, buttons=["copy"], value=saved_d_first_prompt)
+            d_selected_meta = gr.Code(label="Selected shot metadata", language="json", lines=8, value=json.dumps(saved_d_meta, indent=2, ensure_ascii=False) if saved_d_meta else "")
             director_state = gr.State(ui_state.get("director_state", {}))
 
         def on_mode_change(m):
@@ -2378,6 +2432,7 @@ def build_ui():
                 value=choices[0] if choices else None,
                 interactive=bool(choices),
             )
+            timing_md = format_timing_badge(result.get("timings", {}))
             # Persist director UI state.
             save_director_ui_state({
                 "d_scene": args[0], "d_mode": args[1], "d_ref_state": args[2], "d_ref_labels": args[3],
@@ -2389,32 +2444,24 @@ def build_ui():
                 "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
                 "d_prompts": director_prompt_text(result),
                 "d_status": f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",
+                "d_timing_display": timing_md,
             })
-            return (json.dumps({"reference_library": ref},indent=2,ensure_ascii=False) if ref else "No reference images.",
+            return (timing_md, json.dumps({"reference_library": ref},indent=2,ensure_ascii=False) if ref else "No reference images.",
                     json.dumps(result.get("storyboard",[]),indent=2,ensure_ascii=False),director_prompt_text(result),
                     f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",selector_update,
                     first.get("prompt","") if first else "",json.dumps(meta,indent=2,ensure_ascii=False),result)
         d_generate.click(run_director,
             inputs=[d_scene,d_mode,d_ref_state,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
                     backend_sel,ollama_url,vision_model,motion_model,writer_model,temperature_vision,temperature_motion,temperature_writer,num_ctx,keep_alive],
-            outputs=[d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
-        def show_director_shot(choice,result):
-            for p in (result or {}).get("prompts",[]):
-                if p.get("shot_id")==choice:
-                    meta={k:p.get(k) for k in ["shot_id","start_time","end_time","duration"]}
-                    return p.get("prompt","") , json.dumps(meta,indent=2,ensure_ascii=False)
+            outputs=[d_timing_display,d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
+        def show_director_shot(choice, result):
+            for p in (result or {}).get("prompts", []):
+                if str(p.get("shot_id")) == str(choice):
+                    meta = {k: p.get(k) for k in ["shot_id", "start_time", "end_time", "duration"]}
+                    return p.get("prompt", ""), json.dumps(meta, indent=2, ensure_ascii=False)
             return "", "{}"
-        d_shot_selector.change(show_director_shot,inputs=[d_shot_selector,director_state],outputs=[d_selected_prompt,d_selected_meta])
-        d_export.click(save_director,inputs=director_state,outputs=d_saved)
-
-        # If a director sequence was restored, populate the shot selector so the user can browse shots immediately.
-        if ui_state.get("director_state"):
-            d_shots = ui_state["director_state"].get("prompts", [])
-            if d_shots:
-                d_choices = [p["shot_id"] for p in d_shots]
-                d_shot_selector.choices = d_choices
-                d_shot_selector.value = d_choices[0]
-                d_shot_selector.interactive = True
+        d_shot_selector.change(show_director_shot, inputs=[d_shot_selector, director_state], outputs=[d_selected_prompt, d_selected_meta])
+        d_export.click(save_director, inputs=director_state, outputs=d_saved)
 
         # ---- Save UI state reactively on any meaningful input change ----
         # We define one snapshot function that collects every main-tab value.
