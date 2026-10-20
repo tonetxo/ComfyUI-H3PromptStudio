@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import random
 import re
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -442,7 +446,6 @@ def rescan_llamacpp_models() -> str:
     """Regenerate router preset, restart router, and wait for it to come up."""
     try:
         if RESCAN_SCRIPT.exists():
-            import subprocess
             subprocess.run([sys.executable, str(RESCAN_SCRIPT)], check=True, timeout=60)
         subprocess.run(["systemctl", "--user", "restart", "h3ps-llamacpp.service"], check=True, timeout=180)
     except subprocess.CalledProcessError as e:
@@ -1440,21 +1443,37 @@ DIRECTOR_UI_STATE_FIELDS = [
 ]
 
 
+_PERSISTED_REFS: Dict[str, str] = {}
+
+
 def _copy_ref_to_persistent(path: Optional[str], subdir: str) -> Optional[str]:
-    """Copy an uploaded/dropped reference image into outputs/ui_refs/<subdir> so it survives restarts."""
+    """Copy an uploaded/dropped reference image into outputs/ui_refs/<subdir> so it survives restarts.
+
+    State is saved on every field change, so this must be idempotent: files already under
+    UI_REFS_DIR are returned as-is, and new copies are named by content hash so the same
+    image is stored only once.
+    """
     if not path:
         return None
     src = Path(path)
     if not src.exists():
         return str(path)
-    dest_dir = UI_REFS_DIR / subdir
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    # Add a timestamp prefix to avoid collisions and keep original stem.
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    dest = dest_dir / f"{ts}_{src.name}"
     try:
-        import shutil
-        shutil.copy2(src, dest)
+        src.resolve().relative_to(UI_REFS_DIR.resolve())
+        return str(path)
+    except ValueError:
+        pass
+    cached = _PERSISTED_REFS.get(str(src))
+    if cached and Path(cached).exists():
+        return cached
+    try:
+        digest = hashlib.sha1(src.read_bytes()).hexdigest()[:12]
+        dest_dir = UI_REFS_DIR / subdir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{digest}_{src.name}"
+        if not dest.exists():
+            shutil.copy2(src, dest)
+        _PERSISTED_REFS[str(src)] = str(dest)
         return str(dest)
     except Exception:
         return str(path)
@@ -1714,7 +1733,7 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
     return (timing_md,
             json.dumps(analysis, indent=2, ensure_ascii=False) if analysis else "No reference image.",
             json.dumps(motion_plan, indent=2, ensure_ascii=False) if motion_plan else "Motion Director disabled or no reference image.",
-            final, check_ollama(cfg["ollama_url"]), gr.update(choices=history_choices(items), value=f"{hid} — {title.strip() or 'Untitled'} [{timings['total_s']:.1f}s]"))
+            final, check_ollama(cfg["ollama_url"], cfg["backend"]), gr.update(choices=history_choices(items), value=f"{hid} — {title.strip() or 'Untitled'} [{timings['total_s']:.1f}s]"))
 
 
 def restore_history(choice):
@@ -1846,8 +1865,14 @@ def save_director(result):
     (pkg_dir / "director_sequence.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     (pkg_dir / "reference_library.json").write_text(json.dumps(result.get("reference_library", []), indent=2, ensure_ascii=False), encoding="utf-8")
 
-    for p in result.get("prompts", []):
-        shot_filename = f"{p['shot_id']}.txt"
+    used_names = set()
+    for i, p in enumerate(result.get("prompts", []), 1):
+        # shot_id comes from LLM output: keep it to a safe filename and unique per package.
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(p.get("shot_id") or ""))[:64].strip("_") or f"SHOT_{i:02d}"
+        if safe_id in used_names:
+            safe_id = f"{safe_id}_{i:02d}"
+        used_names.add(safe_id)
+        shot_filename = f"{safe_id}.txt"
         (shots_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
         (pkg_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
 
@@ -2288,10 +2313,8 @@ def build_ui():
         def clear_all_r2v():
             return [], [], None, "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        r2v_file.change(append_r2v_refs, inputs=[r2v_file, r2v_state], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
+        # Add/remove/clear handlers for R2V refs are registered below with state persistence.
         r2v_gallery.select(on_r2v_selected, inputs=[r2v_state], outputs=[r2v_selected_idx, r2v_remove_btn])
-        r2v_remove_btn.click(remove_selected_r2v, inputs=[r2v_selected_idx, r2v_state], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
-        r2v_clear_btn.click(clear_all_r2v, outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
         r2v_video_enabled.change(lambda v: gr.update(visible=v), inputs=r2v_video_enabled, outputs=r2v_video_box)
 
         def on_r2v_video_uploaded(file_value):
@@ -2414,11 +2437,8 @@ def build_ui():
         def clear_all_refs():
             return [], [], None, "", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        d_file.upload(append_d_refs, inputs=[d_file, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_refs.upload(append_d_refs, inputs=[d_refs, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        # Add/remove/clear handlers for Director refs are registered below with state persistence.
         d_refs.select(on_ref_selected, inputs=[d_ref_state], outputs=[d_selected_ref_idx, d_remove_selected])
-        d_remove_selected.click(remove_selected_ref, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_clear_refs.click(clear_all_refs, outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
 
         def run_director(*args):
             t_dir_start = time.perf_counter()
@@ -2570,27 +2590,28 @@ def build_ui():
             return None
 
         # Persist director reference images when uploaded or removed.
-        def append_d_refs_and_save(new_files, current_list, current_labels, *rest):
+        # Each handler receives d_scene plus director_inputs_for_save[3:] and rebuilds the full
+        # (d_scene, d_ref_state, d_ref_labels, *rest) tuple expected by _make_director_state_dict.
+        d_refs_outputs = [d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected]
+
+        def append_d_refs_and_save(new_files, current_list, current_labels, scene, *rest):
             updated, gallery, _, labels, _, btn = append_d_refs(new_files, current_list, current_labels)
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_file.upload(append_d_refs_and_save, inputs=[d_file, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_refs.upload(append_d_refs_and_save, inputs=[d_refs, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_file.upload(append_d_refs_and_save, inputs=[d_file, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
+        d_refs.upload(append_d_refs_and_save, inputs=[d_refs, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
-        def remove_selected_ref_and_save(selected_idx, current_list, current_labels, *rest):
+        def remove_selected_ref_and_save(selected_idx, current_list, current_labels, scene, *rest):
             updated, gallery, _, labels, _, btn = remove_selected_ref(selected_idx, current_list, current_labels)
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_remove_selected.click(remove_selected_ref_and_save, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_remove_selected.click(remove_selected_ref_and_save, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
-        def clear_all_refs_and_save(*rest):
+        def clear_all_refs_and_save(scene, *rest):
             updated, gallery, _, labels, _, btn = clear_all_refs()
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_clear_refs.click(clear_all_refs_and_save, inputs=director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_clear_refs.click(clear_all_refs_and_save, inputs=[d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
         # Text / dropdown listeners.
         for comp in (d_scene, d_ref_labels, d_mode, d_total, d_shot, d_preset, d_style, d_camera,
