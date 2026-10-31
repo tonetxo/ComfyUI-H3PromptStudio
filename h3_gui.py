@@ -83,7 +83,7 @@ PRESETS_DATA = {
     "LTX Video FLF": {
         "style": "photorealistic LTX Video first-last frame transition, crisp temporal progression, photorealistic lighting continuity",
         "camera": "specify initial framing from First Frame, then continuous motivated camera move (dolly, pan, tilt, push-in) transitioning toward Last Frame composition",
-        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of Image 1 (FIRST_FRAME) and smoothly evolving into the pose/composition of Image 2 (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
+        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of <Picture 1> (FIRST_FRAME) and smoothly evolving into the pose/composition of <Picture 2> (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
         "audio": "Synchronized diegetic audio matching the physical transition from start to finish.",
         "negative": "Abrupt morphing; teleportation; frozen intermediate frames; identity drift; lighting popping; camera jumps; unwanted music; distorted limbs.",
     },
@@ -93,12 +93,12 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Video_1>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Picture 1>, <Picture 2>, <Video 1>, <Audio 1>, <Audio 0>, or <Voice 1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
-DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
+DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. If the input lists reference_tags (e.g. <Picture 1>, <Picture 2>), you MUST embed each listed tag verbatim inside the prompt, right next to the subject, location or object it depicts (e.g. "the captain from <Picture 1> walks into the hangar from <Picture 2>"). Never rename, renumber, translate or drop these tags. Output ONLY the prompt text."""
 
 # TODO: Add MiniMax Prompt Enhancer contract support to Director Mode. The enhancer expects a single
 # full-reference user envelope; Director Mode currently rewrites per-shot prompts via DIRECTOR_PROMPT_SYSTEM.
@@ -881,6 +881,16 @@ def extract_json(text: str, fallback_key: str = "raw_output") -> Dict[str, Any]:
     }
 
 
+def parse_seconds(value: Any, default: int) -> int:
+    """Parse an LLM-provided duration such as 8, "8", "8s" or "7.5 sec" into whole seconds."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        secs = int(round(value))
+    else:
+        m = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+        secs = int(round(float(m.group()))) if m else 0
+    return secs if secs > 0 else default
+
+
 def _analysis_to_text(analysis: Dict[str, Any]) -> str:
     """Flatten a forensic vision analysis dict into a concise English description."""
     if not isinstance(analysis, dict):
@@ -948,7 +958,7 @@ def analysis_to_enhancer_assets(analysis: Optional[Dict[str, Any]], mode: str) -
             if not isinstance(item, dict):
                 continue
             idx = len(assets) + 1
-            tag = item.get("tag") or f"<Image_{idx}>"
+            tag = item.get("tag") or f"<Picture {idx}>"
             text = _analysis_to_text(item.get("analysis"))
             # The enhancer contract wants "Picture N"; the user will manually map to H3 tags later.
             assets.append(f"Picture {idx}: reference image {tag} — {text}")
@@ -1237,7 +1247,7 @@ def analyze_visual_inputs(cfg: Dict[str, Any], images_dict: Optional[Dict[str, A
             paths = images_dict["r2v_images"][:6]
             ref_list = []
             for i, p in enumerate(paths, 1):
-                tag = f"<Image_{i}>"
+                tag = f"<Picture {i}>"
                 prompt = f"Analyze reference image {tag} ({Path(p).name}) for Reference-to-Video (R2V). Focus on subject identity, key visual features, wardrobe/materials, lighting and spatial anchors. Return valid JSON only."
                 msg = [
                     {"role": "system", "content": VISION_SYSTEM},
@@ -1291,7 +1301,7 @@ def parse_reference_labels(text: str, paths: list[str]) -> list[dict]:
     for i, path in enumerate(paths, 1):
         name = Path(path).name
         role, label = mapping.get(name.lower(), ("GENERAL", Path(path).stem.replace("_", " ").replace("-", " ")))
-        entries.append({"reference_id": f"REF_{i:02d}", "filename": name, "role": role, "label": label, "path": path})
+        entries.append({"reference_id": f"REF_{i:02d}", "tag": f"<Picture {i}>", "filename": name, "role": role, "label": label, "path": path})
     return entries
 
 
@@ -1307,13 +1317,13 @@ def analyze_reference_library(cfg: Dict[str, Any], paths: list[str], labels: str
         raise ValueError(f"El modelo '{model}' no declara capacidad de Vision en Ollama.")
     out = []
     for ref in refs:
-        prompt = f"Analyze reference {ref['reference_id']} ({ref['role']} — {ref['label']}) for continuity in a multi-shot video project. Return valid JSON only. Focus on identity, appearance, geometry, materials, lighting and persistent visual anchors; do not invent off-screen facts."
+        prompt = f"Analyze reference {ref['tag']} ({ref['role']} — {ref['label']}) for continuity in a multi-shot video project. Return valid JSON only. Focus on identity, appearance, geometry, materials, lighting and persistent visual anchors; do not invent off-screen facts."
         raw = ollama_chat(cfg, model, [
             {"role": "system", "content": VISION_SYSTEM},
             {"role": "user", "content": prompt, "images": [image_to_b64(ref["path"])]},
         ], temperature, track_stats=track_stats)
         analysis = extract_json(raw)
-        out.append({"reference_id": ref["reference_id"], "filename": ref["filename"], "role": ref["role"], "label": ref["label"], "analysis": analysis})
+        out.append({"reference_id": ref["reference_id"], "tag": ref["tag"], "filename": ref["filename"], "role": ref["role"], "label": ref["label"], "analysis": analysis})
     return out
 
 def motion_director(cfg: Dict[str, Any], analysis: Dict[str, Any], scene: str, mode: str, duration: str, camera: str, track_stats: Optional[list] = None) -> Dict[str, Any]:
@@ -1329,7 +1339,7 @@ CAMERA REQUEST: {camera or '(choose based on reference)'}
 
 Translate the visual elements into visible, physically plausible motion.
 If First-Last Frame (FLF) analysis is provided, describe the complete physical transition trajectory from the initial frame to the ending frame.
-If multiple reference images (R2V) are provided with tags (<Image_1>, <Image_2>, etc.), coordinate their visible actions while preserving their visual identities and spatial relationships."""
+If multiple reference images (R2V) are provided with tags (<Picture 1>, <Picture 2>, etc.), coordinate their visible actions while preserving their visual identities and spatial relationships."""
     return extract_json(ollama_chat(cfg, cfg["motion_model"], [{"role": "system", "content": MOTION_SYSTEM}, {"role": "user", "content": text}], float(cfg["temperature_motion"]), track_stats=track_stats))
 
 
@@ -1345,9 +1355,9 @@ def build_writer_prompt(scene: str, analysis: Optional[Dict[str, Any]], motion_p
         if audio and ("<Audio" in audio or "<Voice" in audio):
             audio_text = audio
         elif audio:
-            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio 1>."
         else:
-            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio 1>."
     else:
         audio_text = audio or preset_data['audio']
 
@@ -1365,17 +1375,17 @@ You MUST explicitly detail the continuous, physically grounded visual progressio
     has_video_ref = bool(video_ref and video_ref.strip()) or ("<Video" in (scene or "")) or ("<Video" in (constraints or ""))
     video_anchor_desc = ""
     if has_video_ref:
-        v_note = video_ref.strip() if (video_ref and video_ref.strip()) else "Subject motion dynamics, performance, rhythm and camera tracking follow <Video_1>."
-        video_anchor_desc = f"- Video anchor: `<Video_1>`. You MUST explicitly embed `<Video_1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video_1>."
+        v_note = video_ref.strip() if (video_ref and video_ref.strip()) else "Subject motion dynamics, performance, rhythm and camera tracking follow <Video 1>."
+        video_anchor_desc = f"- Video anchor: `<Video 1>`. You MUST explicitly embed `<Video 1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video 1>."
 
-    # R2V Requirement
-    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or "") or (analysis and isinstance(analysis, dict) and "reference_images" in analysis) or has_video_ref:
+    # R2V Requirement (only for R2V; other modes with a video reference get the video-only block below)
+    if mode == "R2V" or (analysis and isinstance(analysis, dict) and "reference_images" in analysis):
         ref_images = analysis.get("reference_images", []) if (analysis and isinstance(analysis, dict)) else []
-        image_tags = [item.get("tag", f"<Image_{i}>") for i, item in enumerate(ref_images, 1)] if ref_images else ["<Image_1>"]
+        image_tags = [item.get("tag", f"<Picture {i}>") for i, item in enumerate(ref_images, 1)] if ref_images else ["<Picture 1>"]
         tags_str = ", ".join(image_tags)
         
         anchor_lines = [
-            "- Audio anchor: `<Audio_1>` (or `<Audio_0>` if specified). You MUST embed `<Audio_1>` into the prompt (e.g. 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>').",
+            "- Audio anchor: `<Audio 1>` (or `<Audio 0>` if specified). You MUST embed `<Audio 1>` into the prompt (e.g. 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio 1>').",
             f"- Visual anchors: {tags_str}. You MUST explicitly reference each visual anchor ({tags_str}) in the prompt describing their specific actions, materials, identity and spatial interactions."
         ]
         if has_video_ref:
@@ -1394,7 +1404,7 @@ NEVER omit the reference tags in the output.
 CRITICAL VIDEO REFERENCE REQUIREMENT:
 A reference video is active in this generation.
 {video_anchor_desc}
-NEVER omit the `<Video_1>` tag in the final prompt.
+NEVER omit the `<Video 1>` tag in the final prompt.
 """)
 
     req_text = "\n".join(specific_requirements)
@@ -1641,10 +1651,10 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
     video_ref_str = ""
     if mode == "R2V" and r2v_video_enabled:
         file_hint = f" ({Path(r2v_video_file).name})" if r2v_video_file else ""
-        note = r2v_video_notes.strip() if r2v_video_notes else "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>."
+        note = r2v_video_notes.strip() if r2v_video_notes else "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>."
         video_ref_str = f"{note}{file_hint}"
     elif "<Video" in (scene or "") or "<Video" in (constraints or ""):
-        video_ref_str = "<Video_1>"
+        video_ref_str = "<Video 1>"
 
     stats_log = []
     t_total_start = time.perf_counter()
@@ -1923,6 +1933,34 @@ def extract_paths(value: Any) -> list[str]:
 
 
 
+def _director_shot_tags(shot: Dict[str, Any], reference_library: list[dict]) -> list[str]:
+    """Tags this shot must reference: the planner's choice if valid, else every reference."""
+    all_tags = [r["tag"] for r in reference_library if r.get("tag")]
+    raw = shot.get("reference_tags")
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        picked = []
+        for t in raw:
+            m = re.search(r"(\d+)", str(t))
+            tag = f"<Picture {m.group(1)}>" if m else None
+            if tag in all_tags and tag not in picked:
+                picked.append(tag)
+        if picked:
+            return picked
+    return all_tags
+
+
+def _ensure_reference_tags(prompt: str, tags: list[str], reference_library: list[dict]) -> str:
+    """Fallback: if the writer dropped any tag, append an explicit reference line."""
+    missing = [t for t in tags if t not in prompt]
+    if not missing:
+        return prompt
+    by_tag = {r["tag"]: r for r in reference_library}
+    parts = [f"{by_tag[t].get('label') or by_tag[t].get('role', '').lower()} {t}".strip() for t in missing]
+    return f"{prompt.rstrip()}\nReferences: " + ", ".join(parts) + "."
+
+
 def director_generate(scene, mode, reference_files, reference_labels, total_duration, shot_duration, preset, style, camera, motion, audio, dialogue, constraints,
                        backend, ollama_url, vision_model, director_model, writer_model, tv, td, tw, num_ctx, keep_alive):
     cfg = load_config()
@@ -1972,6 +2010,11 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
         "total_duration_seconds": total, "target_shot_duration_seconds": target,
         "shot_count": count, "shot_durations_seconds": durations
     }
+    if reference_library:
+        planner_input["reference_instructions"] = (
+            "Each reference has a tag (<Picture 1>, <Picture 2>, ...). Add a 'reference_tags' list to every shot "
+            "with the tags of the references visible or relevant in that shot, and refer to references by their tag "
+            "in subject_action / prompt_notes.")
     t_d_start = time.perf_counter()
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
@@ -1988,17 +2031,25 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     timeline = 0
     prompts = []
     t_w_start = time.perf_counter()
+    seen_ids = set()
     for i, shot in enumerate(shots, 1):
-        dur = int(shot.get("duration") or durations[min(i-1, len(durations)-1)])
+        dur = parse_seconds(shot.get("duration"), durations[min(i-1, len(durations)-1)])
         dur = max(5, min(30, dur))
         shot_id = str(shot.get("shot_id") or f"SHOT_{i:02d}")
+        if shot_id in seen_ids:
+            shot_id = f"{shot_id}_{i:02d}"
+        seen_ids.add(shot_id)
         shot["shot_id"] = shot_id; shot["start_time"] = timeline; shot["end_time"] = timeline + dur; shot["duration"] = dur
         payload = {"target_workflow": mode, "workflow_target": f"MiniMax H3 ({mode})", "shot": shot, "continuity_bible": bible, "global_style": plan.get("global_style") or style,
                    "global_audio": plan.get("global_audio") or audio, "reference_library": reference_library, "user_constraints": constraints}
+        shot_tags = _director_shot_tags(shot, reference_library)
+        if shot_tags:
+            payload["reference_tags"] = shot_tags
         prompt = ollama_chat(cfg, writer_model, [
             {"role":"system","content":DIRECTOR_PROMPT_SYSTEM},
             {"role":"user","content":json.dumps(payload, ensure_ascii=False, indent=2)}
         ], tw, track_stats=stats_log, max_tokens=4096).strip()
+        prompt = _ensure_reference_tags(prompt, shot_tags, reference_library)
         prompts.append({"shot_id":shot_id,"start_time":timeline,"end_time":timeline+dur,"duration":dur,"prompt":prompt})
         timeline += dur
     t_writer = time.perf_counter() - t_w_start
@@ -2075,33 +2126,33 @@ def build_ui():
                 # --- Adaptive Visual References Container ---
                 # 1. Single Reference (I2VA, L2VA, T2VA)
                 with gr.Row(visible=single_visible) as single_img_row:
-                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label="Reference Image (<Image_1>)", sources=["upload", "clipboard"])
+                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label="Reference Image (<Picture 1>)", sources=["upload", "clipboard"])
 
                 # 2. Dual Reference (FLF2VA / LTX Video FLF)
                 with gr.Row(visible=flf_visible) as flf_img_row:
-                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label="First Frame (<Image_1> - Start / Initial State)", sources=["upload", "clipboard"])
-                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label="Last Frame (<Image_2> - End / Target State)", sources=["upload", "clipboard"])
+                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label="First Frame (<Picture 1> - Start / Initial State)", sources=["upload", "clipboard"])
+                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label="Last Frame (<Picture 2> - End / Target State)", sources=["upload", "clipboard"])
 
                 # 3. Multi Reference (R2V - up to 6 images)
                 saved_r2v_paths = ui_state.get("r2v_state", [])
-                saved_r2v_items = [(p, f"<Image_{i}>: {Path(p).name}") for i, p in enumerate(saved_r2v_paths, 1) if Path(p).exists()]
+                saved_r2v_items = [(p, f"<Picture {i}>: {Path(p).name}") for i, p in enumerate(saved_r2v_paths, 1) if Path(p).exists()]
                 r2v_info_md = (
-                    f"**{len(saved_r2v_items)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(saved_r2v_items) + 1)])
+                    f"**{len(saved_r2v_items)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(saved_r2v_items) + 1)])
                     if saved_r2v_items
-                    else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+                    else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
                 )
                 with gr.Column(visible=r2v_visible) as r2v_img_col:
                     r2v_state = gr.State(saved_r2v_paths)
                     r2v_selected_idx = gr.State(None)
                     r2v_file = gr.File(
-                        label="Upload Reference Images for R2V (Up to 6 images: <Image_1> to <Image_6>)",
+                        label="Upload Reference Images for R2V (Up to 6 images: <Picture 1> to <Picture 6>)",
                         file_count="multiple",
                         file_types=["image"],
                         type="filepath",
                     )
                     r2v_gallery = gr.Gallery(
                         value=saved_r2v_items,
-                        label="R2V References (<Image_1> ... <Image_6>)",
+                        label="R2V References (<Picture 1> ... <Picture 6>)",
                         show_label=True,
                         columns=3,
                         height=200,
@@ -2120,15 +2171,15 @@ def build_ui():
                         visible=r2v_visible,
                     )
                     r2v_tags_info = gr.Markdown(r2v_info_md)
-                    r2v_video_enabled = gr.Checkbox(label="🎬 Incluir Referencia de Vídeo (<Video_1>)", value=ui_state.get("r2v_video_enabled", False))
+                    r2v_video_enabled = gr.Checkbox(label="🎬 Incluir Referencia de Vídeo (<Video 1>)", value=ui_state.get("r2v_video_enabled", False))
                     r2v_video_box_visible = bool(ui_state.get("r2v_video_enabled", False))
                     with gr.Column(visible=r2v_video_box_visible) as r2v_video_box:
-                        r2v_video_file = gr.File(value=ui_state.get("r2v_video_file"), label="Archivo de Vídeo opcional (<Video_1>) — (Referencia de etiqueta, 0 VRAM)", file_count="single", file_types=["video"], type="filepath")
+                        r2v_video_file = gr.File(value=ui_state.get("r2v_video_file"), label="Archivo de Vídeo opcional (<Video 1>) — (Referencia de etiqueta, 0 VRAM)", file_count="single", file_types=["video"], type="filepath")
                         r2v_video_notes = gr.Textbox(
-                            label="Instrucción de Vídeo (<Video_1>)",
-                            placeholder="Opcional: p.ej. 'Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>'",
+                            label="Instrucción de Vídeo (<Video 1>)",
+                            placeholder="Opcional: p.ej. 'Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>'",
                             lines=2,
-                            value=ui_state.get("r2v_video_notes", "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>.")
+                            value=ui_state.get("r2v_video_notes", "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>.")
                         )
                 # ---------------------------------------------
 
@@ -2290,14 +2341,14 @@ def build_ui():
                 if p and p not in updated and len(updated) < 6:
                     updated.append(p)
             updated = updated[:6]
-            gallery_items = [(path, f"<Image_{i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
-            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def on_r2v_selected(current_list, evt: gr.SelectData):
             idx = evt.index
             if isinstance(idx, (int, float)) and 0 <= int(idx) < len(current_list or []):
-                tag = f"<Image_{int(idx)+1}>"
+                tag = f"<Picture {int(idx)+1}>"
                 fname = Path(current_list[int(idx)]).name
                 return int(idx), gr.update(interactive=True, value=f"🗑️ Eliminar {tag} ({fname})")
             return None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
@@ -2306,12 +2357,12 @@ def build_ui():
             updated = list(current_list or [])
             if selected_idx is not None and isinstance(selected_idx, (int, float)) and 0 <= int(selected_idx) < len(updated):
                 updated.pop(int(selected_idx))
-            gallery_items = [(path, f"<Image_{i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
-            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def clear_all_r2v():
-            return [], [], None, "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+            return [], [], None, "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         # Add/remove/clear handlers for R2V refs are registered below with state persistence.
         r2v_gallery.select(on_r2v_selected, inputs=[r2v_state], outputs=[r2v_selected_idx, r2v_remove_btn])

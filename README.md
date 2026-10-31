@@ -42,7 +42,7 @@ It implements a 3-tier multimodal chain (**Forensic Vision Analysis $\rightarrow
 * 🏃 **Physical Motion Director (`H3_MotionDirector`)**: Converts static reference frames into observable physical motion (inertia, cloth/hair physics, fluid dynamics, camera momentum).
 * ✍️ **Cinematic Prompt Writer (`H3_PromptWriter`)**: Produces structured, temporally sequenced English prompts optimized for generative video engines.
 * 🎞️ **First-Last Frame (FLF) Support**: Dual image inputs (`first_frame_image` & `last_frame_image`) for calculating smooth physical transition trajectories.
-* 🎵 **R2V Audio Reference Support**: Automatic embedding and preservation of functional tags like `<Audio_1>`, `<Audio_0>`, and `<Voice_1>` for Reference-to-Video workflows.
+* 🎵 **R2V Audio Reference Support**: Automatic embedding and preservation of functional tags like `<Audio 1>`, `<Audio 0>`, and `<Voice 1>` for Reference-to-Video workflows.
 * 🎥 **Director Mode (`H3_DirectorMode`)**: Storyboard and shot sequencer for 20–180s scenes with a shared Continuity Bible across consecutive shots.
 * ⚡ **Dynamic Ollama Model Selection**: Automatically queries your local Ollama instance (`/api/tags`) and populates native searchable dropdowns with smart default fallbacks.
 

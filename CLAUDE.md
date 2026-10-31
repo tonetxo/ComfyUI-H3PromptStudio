@@ -41,7 +41,7 @@ The same pipeline exists in three separately maintained copies that have drifted
 
 In `do_generate`, if the writer model name matches `is_minimax_enhancer()` (`minimax`+`enhancer` or `video-prompt-enhancer`), the writer step uses `generate_enhanced_prompt()` with per-mode structured system prompts (`ENHANCER_SYSTEM_*`: T2VA / I2VA / FL2VA / L2VA / REF for R2V). If `is_enhancer_output_valid()` rejects the result, it falls back to the generic `build_writer_prompt()` + `generate_prompt()` path. LLM JSON output goes through `extract_json` / `_try_parse_json` / `_repair_json`, which tolerate malformed model output.
 
-Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags like `<Image_1>`, `<Video_1>`, `<Audio_1>`, `<Voice_1>` must survive verbatim into the final prompt. In Director Mode the GUI's Motion model selector doubles as the Director/Planner model (see `DIRECTOR_MODE.md`).
+Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags like `<Picture 1>`, `<Video 1>`, `<Audio 1>`, `<Voice 1>` must survive verbatim into the final prompt. In Director Mode the GUI's Motion model selector doubles as the Director/Planner model (see `DIRECTOR_MODE.md`).
 
 ## State the GUI writes (don't hand-edit while it runs)
 
