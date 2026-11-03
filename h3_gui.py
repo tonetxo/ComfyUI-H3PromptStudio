@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import random
 import re
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -32,6 +36,12 @@ DEFAULT_CONFIG = {
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
 PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
+DIRECTOR_TOTALS = ["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"]
+DIRECTOR_SHOTS = ["5","6","8","10","12","15","18","20","25","30"]
+# Director form values stored with each sequence, so a loaded package can be rebuilt as it was made.
+DIRECTOR_FORM_FIELDS = ("d_scene", "d_mode", "d_total", "d_shot", "d_preset", "d_style", "d_camera",
+                        "d_motion", "d_audio", "d_dialogue", "d_constraints")
+DIRECTOR_FORM_CHOICES = {"d_mode": MODES, "d_total": DIRECTOR_TOTALS, "d_shot": DIRECTOR_SHOTS, "d_preset": PRESETS}
 
 PRESETS_DATA = {
     "H3 Cinematic": {
@@ -79,7 +89,7 @@ PRESETS_DATA = {
     "LTX Video FLF": {
         "style": "photorealistic LTX Video first-last frame transition, crisp temporal progression, photorealistic lighting continuity",
         "camera": "specify initial framing from First Frame, then continuous motivated camera move (dolly, pan, tilt, push-in) transitioning toward Last Frame composition",
-        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of Image 1 (FIRST_FRAME) and smoothly evolving into the pose/composition of Image 2 (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
+        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of <Picture 1> (FIRST_FRAME) and smoothly evolving into the pose/composition of <Picture 2> (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
         "audio": "Synchronized diegetic audio matching the physical transition from start to finish.",
         "negative": "Abrupt morphing; teleportation; frozen intermediate frames; identity drift; lighting popping; camera jumps; unwanted music; distorted limbs.",
     },
@@ -89,12 +99,12 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Video_1>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Picture 1>, <Picture 2>, <Video 1>, <Audio 1>, <Audio 0>, or <Voice 1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
-DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
+DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. If the input lists reference_tags (e.g. <Picture 1>, <Picture 2>), you MUST embed each listed tag verbatim inside the prompt, right next to the subject, location or object it depicts (e.g. "the captain from <Picture 1> walks into the hangar from <Picture 2>"). Never rename, renumber, translate or drop these tags. Output ONLY the prompt text."""
 
 # TODO: Add MiniMax Prompt Enhancer contract support to Director Mode. The enhancer expects a single
 # full-reference user envelope; Director Mode currently rewrites per-shot prompts via DIRECTOR_PROMPT_SYSTEM.
@@ -424,7 +434,7 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
         except Exception:
             models = []
         # Ensure known fallbacks and newly-downloaded GGUFs are selectable.
-        fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b", "qwen3.8-27b"]
+        fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b"]
         for m in fallback:
             if m not in models:
                 models.append(m)
@@ -442,7 +452,6 @@ def rescan_llamacpp_models() -> str:
     """Regenerate router preset, restart router, and wait for it to come up."""
     try:
         if RESCAN_SCRIPT.exists():
-            import subprocess
             subprocess.run([sys.executable, str(RESCAN_SCRIPT)], check=True, timeout=60)
         subprocess.run(["systemctl", "--user", "restart", "h3ps-llamacpp.service"], check=True, timeout=180)
     except subprocess.CalledProcessError as e:
@@ -878,6 +887,16 @@ def extract_json(text: str, fallback_key: str = "raw_output") -> Dict[str, Any]:
     }
 
 
+def parse_seconds(value: Any, default: int) -> int:
+    """Parse an LLM-provided duration such as 8, "8", "8s" or "7.5 sec" into whole seconds."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        secs = int(round(value))
+    else:
+        m = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+        secs = int(round(float(m.group()))) if m else 0
+    return secs if secs > 0 else default
+
+
 def _analysis_to_text(analysis: Dict[str, Any]) -> str:
     """Flatten a forensic vision analysis dict into a concise English description."""
     if not isinstance(analysis, dict):
@@ -945,7 +964,7 @@ def analysis_to_enhancer_assets(analysis: Optional[Dict[str, Any]], mode: str) -
             if not isinstance(item, dict):
                 continue
             idx = len(assets) + 1
-            tag = item.get("tag") or f"<Image_{idx}>"
+            tag = item.get("tag") or f"<Picture {idx}>"
             text = _analysis_to_text(item.get("analysis"))
             # The enhancer contract wants "Picture N"; the user will manually map to H3 tags later.
             assets.append(f"Picture {idx}: reference image {tag} — {text}")
@@ -1234,7 +1253,7 @@ def analyze_visual_inputs(cfg: Dict[str, Any], images_dict: Optional[Dict[str, A
             paths = images_dict["r2v_images"][:6]
             ref_list = []
             for i, p in enumerate(paths, 1):
-                tag = f"<Image_{i}>"
+                tag = f"<Picture {i}>"
                 prompt = f"Analyze reference image {tag} ({Path(p).name}) for Reference-to-Video (R2V). Focus on subject identity, key visual features, wardrobe/materials, lighting and spatial anchors. Return valid JSON only."
                 msg = [
                     {"role": "system", "content": VISION_SYSTEM},
@@ -1288,7 +1307,7 @@ def parse_reference_labels(text: str, paths: list[str]) -> list[dict]:
     for i, path in enumerate(paths, 1):
         name = Path(path).name
         role, label = mapping.get(name.lower(), ("GENERAL", Path(path).stem.replace("_", " ").replace("-", " ")))
-        entries.append({"reference_id": f"REF_{i:02d}", "filename": name, "role": role, "label": label, "path": path})
+        entries.append({"reference_id": f"REF_{i:02d}", "tag": f"<Picture {i}>", "filename": name, "role": role, "label": label, "path": path})
     return entries
 
 
@@ -1304,13 +1323,13 @@ def analyze_reference_library(cfg: Dict[str, Any], paths: list[str], labels: str
         raise ValueError(f"El modelo '{model}' no declara capacidad de Vision en Ollama.")
     out = []
     for ref in refs:
-        prompt = f"Analyze reference {ref['reference_id']} ({ref['role']} — {ref['label']}) for continuity in a multi-shot video project. Return valid JSON only. Focus on identity, appearance, geometry, materials, lighting and persistent visual anchors; do not invent off-screen facts."
+        prompt = f"Analyze reference {ref['tag']} ({ref['role']} — {ref['label']}) for continuity in a multi-shot video project. Return valid JSON only. Focus on identity, appearance, geometry, materials, lighting and persistent visual anchors; do not invent off-screen facts."
         raw = ollama_chat(cfg, model, [
             {"role": "system", "content": VISION_SYSTEM},
             {"role": "user", "content": prompt, "images": [image_to_b64(ref["path"])]},
         ], temperature, track_stats=track_stats)
         analysis = extract_json(raw)
-        out.append({"reference_id": ref["reference_id"], "filename": ref["filename"], "role": ref["role"], "label": ref["label"], "analysis": analysis})
+        out.append({"reference_id": ref["reference_id"], "tag": ref["tag"], "filename": ref["filename"], "role": ref["role"], "label": ref["label"], "analysis": analysis})
     return out
 
 def motion_director(cfg: Dict[str, Any], analysis: Dict[str, Any], scene: str, mode: str, duration: str, camera: str, track_stats: Optional[list] = None) -> Dict[str, Any]:
@@ -1326,7 +1345,7 @@ CAMERA REQUEST: {camera or '(choose based on reference)'}
 
 Translate the visual elements into visible, physically plausible motion.
 If First-Last Frame (FLF) analysis is provided, describe the complete physical transition trajectory from the initial frame to the ending frame.
-If multiple reference images (R2V) are provided with tags (<Image_1>, <Image_2>, etc.), coordinate their visible actions while preserving their visual identities and spatial relationships."""
+If multiple reference images (R2V) are provided with tags (<Picture 1>, <Picture 2>, etc.), coordinate their visible actions while preserving their visual identities and spatial relationships."""
     return extract_json(ollama_chat(cfg, cfg["motion_model"], [{"role": "system", "content": MOTION_SYSTEM}, {"role": "user", "content": text}], float(cfg["temperature_motion"]), track_stats=track_stats))
 
 
@@ -1342,9 +1361,9 @@ def build_writer_prompt(scene: str, analysis: Optional[Dict[str, Any]], motion_p
         if audio and ("<Audio" in audio or "<Voice" in audio):
             audio_text = audio
         elif audio:
-            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio 1>."
         else:
-            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio 1>."
     else:
         audio_text = audio or preset_data['audio']
 
@@ -1362,17 +1381,17 @@ You MUST explicitly detail the continuous, physically grounded visual progressio
     has_video_ref = bool(video_ref and video_ref.strip()) or ("<Video" in (scene or "")) or ("<Video" in (constraints or ""))
     video_anchor_desc = ""
     if has_video_ref:
-        v_note = video_ref.strip() if (video_ref and video_ref.strip()) else "Subject motion dynamics, performance, rhythm and camera tracking follow <Video_1>."
-        video_anchor_desc = f"- Video anchor: `<Video_1>`. You MUST explicitly embed `<Video_1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video_1>."
+        v_note = video_ref.strip() if (video_ref and video_ref.strip()) else "Subject motion dynamics, performance, rhythm and camera tracking follow <Video 1>."
+        video_anchor_desc = f"- Video anchor: `<Video 1>`. You MUST explicitly embed `<Video 1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video 1>."
 
-    # R2V Requirement
-    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or "") or (analysis and isinstance(analysis, dict) and "reference_images" in analysis) or has_video_ref:
+    # R2V Requirement (only for R2V; other modes with a video reference get the video-only block below)
+    if mode == "R2V" or (analysis and isinstance(analysis, dict) and "reference_images" in analysis):
         ref_images = analysis.get("reference_images", []) if (analysis and isinstance(analysis, dict)) else []
-        image_tags = [item.get("tag", f"<Image_{i}>") for i, item in enumerate(ref_images, 1)] if ref_images else ["<Image_1>"]
+        image_tags = [item.get("tag", f"<Picture {i}>") for i, item in enumerate(ref_images, 1)] if ref_images else ["<Picture 1>"]
         tags_str = ", ".join(image_tags)
         
         anchor_lines = [
-            "- Audio anchor: `<Audio_1>` (or `<Audio_0>` if specified). You MUST embed `<Audio_1>` into the prompt (e.g. 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>').",
+            "- Audio anchor: `<Audio 1>` (or `<Audio 0>` if specified). You MUST embed `<Audio 1>` into the prompt (e.g. 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio 1>').",
             f"- Visual anchors: {tags_str}. You MUST explicitly reference each visual anchor ({tags_str}) in the prompt describing their specific actions, materials, identity and spatial interactions."
         ]
         if has_video_ref:
@@ -1391,7 +1410,7 @@ NEVER omit the reference tags in the output.
 CRITICAL VIDEO REFERENCE REQUIREMENT:
 A reference video is active in this generation.
 {video_anchor_desc}
-NEVER omit the `<Video_1>` tag in the final prompt.
+NEVER omit the `<Video 1>` tag in the final prompt.
 """)
 
     req_text = "\n".join(specific_requirements)
@@ -1440,21 +1459,37 @@ DIRECTOR_UI_STATE_FIELDS = [
 ]
 
 
+_PERSISTED_REFS: Dict[str, str] = {}
+
+
 def _copy_ref_to_persistent(path: Optional[str], subdir: str) -> Optional[str]:
-    """Copy an uploaded/dropped reference image into outputs/ui_refs/<subdir> so it survives restarts."""
+    """Copy an uploaded/dropped reference image into outputs/ui_refs/<subdir> so it survives restarts.
+
+    State is saved on every field change, so this must be idempotent: files already under
+    UI_REFS_DIR are returned as-is, and new copies are named by content hash so the same
+    image is stored only once.
+    """
     if not path:
         return None
     src = Path(path)
     if not src.exists():
         return str(path)
-    dest_dir = UI_REFS_DIR / subdir
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    # Add a timestamp prefix to avoid collisions and keep original stem.
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    dest = dest_dir / f"{ts}_{src.name}"
     try:
-        import shutil
-        shutil.copy2(src, dest)
+        src.resolve().relative_to(UI_REFS_DIR.resolve())
+        return str(path)
+    except ValueError:
+        pass
+    cached = _PERSISTED_REFS.get(str(src))
+    if cached and Path(cached).exists():
+        return cached
+    try:
+        digest = hashlib.sha1(src.read_bytes()).hexdigest()[:12]
+        dest_dir = UI_REFS_DIR / subdir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{digest}_{src.name}"
+        if not dest.exists():
+            shutil.copy2(src, dest)
+        _PERSISTED_REFS[str(src)] = str(dest)
         return str(dest)
     except Exception:
         return str(path)
@@ -1622,10 +1657,10 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
     video_ref_str = ""
     if mode == "R2V" and r2v_video_enabled:
         file_hint = f" ({Path(r2v_video_file).name})" if r2v_video_file else ""
-        note = r2v_video_notes.strip() if r2v_video_notes else "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>."
+        note = r2v_video_notes.strip() if r2v_video_notes else "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>."
         video_ref_str = f"{note}{file_hint}"
     elif "<Video" in (scene or "") or "<Video" in (constraints or ""):
-        video_ref_str = "<Video_1>"
+        video_ref_str = "<Video 1>"
 
     stats_log = []
     t_total_start = time.perf_counter()
@@ -1714,7 +1749,7 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
     return (timing_md,
             json.dumps(analysis, indent=2, ensure_ascii=False) if analysis else "No reference image.",
             json.dumps(motion_plan, indent=2, ensure_ascii=False) if motion_plan else "Motion Director disabled or no reference image.",
-            final, check_ollama(cfg["ollama_url"]), gr.update(choices=history_choices(items), value=f"{hid} — {title.strip() or 'Untitled'} [{timings['total_s']:.1f}s]"))
+            final, check_ollama(cfg["ollama_url"], cfg["backend"]), gr.update(choices=history_choices(items), value=f"{hid} — {title.strip() or 'Untitled'} [{timings['total_s']:.1f}s]"))
 
 
 def restore_history(choice):
@@ -1829,9 +1864,194 @@ def save_text(kind: str, text: str) -> str:
     return f"Saved: {latest_path.name} | Archived: archive/{archive_path.name}"
 
 
+def _director_package_dirs() -> list[Path]:
+    """Saved Director package directories, newest first."""
+    root = ROOT / "outputs" / "director_packages"
+    return sorted((p for p in root.glob("package_*") if p.is_dir()), key=lambda p: p.name, reverse=True)
+
+
+def director_package_choices() -> list[tuple[str, str]]:
+    """(label, package name) pairs for the Director package selector."""
+    choices = []
+    for pkg in _director_package_dirs():
+        try:
+            data = json.loads((pkg / "director_sequence.json").read_text(encoding="utf-8"))
+            label = f"{pkg.name} — {data.get('project_title') or 'Untitled'} ({data.get('shot_count', 0)} shots, {data.get('total_duration', 0)}s)"
+        except (OSError, ValueError, AttributeError):
+            label = f"{pkg.name} — (unreadable)"
+        choices.append((label, pkg.name))
+    return choices
+
+
+def refresh_director_package_selector():
+    return gr.update(choices=director_package_choices())
+
+
+def director_panels(result: Dict[str, Any], status: str) -> tuple[Dict[str, Any], tuple]:
+    """Build the Director result panels from a sequence.
+
+    Returns (fields to persist in ui_state, values for the panel outputs). Shared by a
+    fresh build and a loaded package so both leave the tab in the same state.
+    """
+    prompts = result.get("prompts", [])
+    bible = {"continuity_bible": result.get("continuity_bible") or {}, "reference_library": result.get("reference_library") or []}
+    persisted = {
+        "director_state": result,
+        "d_bible": json.dumps(bible, indent=2, ensure_ascii=False),
+        "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
+        "d_prompts": director_prompt_text(result),
+        "d_status": status,
+        "d_timing_display": format_timing_badge(result.get("timings", {})),
+    }
+    choices = [str(p.get("shot_id") or f"SHOT_{i:02d}") for i, p in enumerate(prompts, 1)]
+    first = prompts[0] if prompts else {}
+    meta = {k: first.get(k) for k in ["shot_id", "start_time", "end_time", "duration"]} if first else {}
+    selector_update = gr.update(choices=choices, value=choices[0] if choices else None, interactive=bool(choices))
+    outputs = (
+        persisted["d_timing_display"], persisted["d_bible"], persisted["d_storyboard"], persisted["d_prompts"],
+        status, selector_update, first.get("prompt", ""), json.dumps(meta, indent=2, ensure_ascii=False), result,
+    )
+    return persisted, outputs
+
+
+def _find_ui_ref(name: str) -> Optional[Path]:
+    """Find a reference in outputs/ui_refs by its name, with or without the content-hash prefix."""
+    if not name or not UI_REFS_DIR.is_dir():
+        return None
+    pattern = re.compile(r"(?:[0-9a-f]{12}_)?" + re.escape(name))
+    matches = [p for p in UI_REFS_DIR.rglob("*") if p.is_file() and pattern.fullmatch(p.name)]
+    # Prefer Director's own copies; the hash prefix can hide same-named files, so newest wins.
+    return max(matches, key=lambda p: (p.parent.name == "director", p.stat().st_mtime), default=None)
+
+
+def _reference_name(result: Dict[str, Any], index: int) -> str:
+    """Bare file name of reference `index`. Packages saved before images were archived only have `filename`."""
+    files = result.get("reference_files") or []
+    stored = files[index] if index < len(files) else None
+    return Path(str(stored or result["reference_library"][index].get("filename") or "")).name
+
+
+def _archive_references(result: Dict[str, Any], pkg_dir: Path) -> list[str]:
+    """Copy the sequence's reference images into the package. Returns the names that could not be copied."""
+    failed = []
+    files = result.get("reference_files") or []
+    for i in range(len(result.get("reference_library") or [])):
+        name = _reference_name(result, i)
+        stored = Path(files[i]) if i < len(files) and files[i] else None
+        src = stored if stored and stored.is_file() else _find_ui_ref(name)
+        try:
+            if src is None:
+                raise FileNotFoundError(name)
+            (pkg_dir / "refs").mkdir(exist_ok=True)
+            shutil.copy2(src, pkg_dir / "refs" / name)
+        except OSError:
+            failed.append(name)
+    return failed
+
+
+def restore_package_references(pkg: Path, result: Dict[str, Any]) -> tuple[list[Optional[str]], str, list[str]]:
+    """Locate a package's reference images.
+
+    Only looks inside the package and outputs/ui_refs, never at paths stored in its JSON.
+    Returns (one path or None per reference, labels text for the found ones, missing names).
+    """
+    paths: list[Optional[str]] = []
+    labels = []
+    missing = []
+    for i, ref in enumerate(result.get("reference_library") or []):
+        name = _reference_name(result, i)
+        packaged = pkg / "refs" / name if name else None
+        if packaged and packaged.is_file():
+            # Keep the name: copying through _copy_ref_to_persistent would stack another hash prefix.
+            found = UI_REFS_DIR / "director" / name
+            if not found.exists():
+                found.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(packaged, found)
+        else:
+            found = _find_ui_ref(name)
+        if found is None:
+            paths.append(None)
+            missing.append(name or str(ref.get("reference_id")))
+            continue
+        paths.append(str(found))
+        labels.append(f"{found.name} | {ref.get('role') or 'GENERAL'} | {ref.get('label') or found.stem}")
+    return paths, "\n".join(labels), missing
+
+
+def restore_package_form(result: Dict[str, Any]) -> tuple[Dict[str, str], list[str]]:
+    """Valid form values stored in a package, and the fields that have to keep their current value.
+
+    Dropdown values are checked because Gradio rejects the next event if one is not among its choices.
+    """
+    form = result.get("director_form")
+    form = form if isinstance(form, dict) else {}
+    values = {}
+    for field in DIRECTOR_FORM_FIELDS:
+        value = form.get(field)
+        allowed = DIRECTOR_FORM_CHOICES.get(field)
+        if isinstance(value, str) and (allowed is None or value in allowed):
+            values[field] = value
+    return values, [f for f in DIRECTOR_FORM_FIELDS if f not in values]
+
+
+def load_director_package(name: Optional[str]):
+    """Restore a saved package into the Director panels, reference gallery and form.
+
+    On failure only the status changes.
+    """
+    def failed(message: str) -> tuple:
+        return (gr.update(),) * 4 + (message,) + (gr.update(),) * (9 + len(DIRECTOR_FORM_FIELDS))
+
+    if not name:
+        return failed("Select a saved package to load.")
+    # Match against what is on disk so the name can never address a path outside director_packages.
+    pkg = next((p for p in _director_package_dirs() if p.name == name), None)
+    if pkg is None:
+        return failed(f"Package not found: {name}")
+    try:
+        result = json.loads((pkg / "director_sequence.json").read_text(encoding="utf-8"))
+        ref_paths, ref_labels, missing = restore_package_references(pkg, result)
+        result["reference_files"] = ref_paths  # so saving this sequence again archives the images too
+        found = [p for p in ref_paths if p]
+        status = f"Loaded {name} — {result.get('shot_count', 0)} shots / {result.get('total_duration', 0)}s"
+        if ref_paths:
+            status += f" · {len(found)}/{len(ref_paths)} reference images"
+        if missing:
+            status += f" · MISSING (<Picture N> numbering may shift if you rebuild): {', '.join(missing)}"
+        form, form_kept = restore_package_form(result)
+        if not form:
+            status += " · form not stored in this package: current values kept"
+        elif form_kept:
+            status += f" · current values kept for: {', '.join(form_kept)}"
+        persisted, outputs = director_panels(result, status)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return failed(f"Could not load {name}: {exc}")
+    save_director_ui_state({**persisted, **form, "d_ref_state": found, "d_ref_labels": ref_labels})
+    form_outputs = tuple(form.get(f, gr.update()) for f in DIRECTOR_FORM_FIELDS)
+    return outputs + (found, found, ref_labels, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs
+
+
+def list_director_packages(limit: int = 20) -> str:
+    """Describe the saved Director packages on disk, newest first."""
+    packages = _director_package_dirs()
+    if not packages:
+        return "No saved Director packages yet."
+    blocks = []
+    for pkg in packages[:limit]:
+        entries = sorted(f.name for f in pkg.iterdir() if f.is_file())
+        if (pkg / "refs").is_dir():
+            entries.append(f"refs/ ({sum(1 for f in (pkg / 'refs').iterdir() if f.is_file())} images)")
+        files = ", ".join(entries) or "(empty)"
+        blocks.append(f"outputs/director_packages/{pkg.name}/\n  {files}")
+    hidden = len(packages) - limit
+    if hidden > 0:
+        blocks.append(f"... and {hidden} older package(s) in outputs/director_packages/")
+    return "\n".join(blocks)
+
+
 def save_director(result):
     if not result:
-        return "No director package to save."
+        return f"No director package to save.\n\n{list_director_packages()}"
     out = ROOT / "outputs"
     out.mkdir(exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1846,12 +2066,20 @@ def save_director(result):
     (pkg_dir / "director_sequence.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     (pkg_dir / "reference_library.json").write_text(json.dumps(result.get("reference_library", []), indent=2, ensure_ascii=False), encoding="utf-8")
 
-    for p in result.get("prompts", []):
-        shot_filename = f"{p['shot_id']}.txt"
+    used_names = set()
+    for i, p in enumerate(result.get("prompts", []), 1):
+        # shot_id comes from LLM output: keep it to a safe filename and unique per package.
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(p.get("shot_id") or ""))[:64].strip("_") or f"SHOT_{i:02d}"
+        if safe_id in used_names:
+            safe_id = f"{safe_id}_{i:02d}"
+        used_names.add(safe_id)
+        shot_filename = f"{safe_id}.txt"
         (shots_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
         (pkg_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
 
-    return f"Saved in outputs/ and archived in: outputs/director_packages/package_{timestamp}/"
+    not_archived = _archive_references(result, pkg_dir)
+    warning = f"\nReference images NOT archived: {', '.join(not_archived)}" if not_archived else ""
+    return f"Saved in outputs/ and archived in: outputs/director_packages/package_{timestamp}/{warning}\n\n{list_director_packages()}"
 
 
 def apply_preset(preset):
@@ -1896,6 +2124,34 @@ def extract_paths(value: Any) -> list[str]:
     single = _get_path_from_single(value)
     return [single] if single else []
 
+
+
+def _director_shot_tags(shot: Dict[str, Any], reference_library: list[dict]) -> list[str]:
+    """Tags this shot must reference: the planner's choice if valid, else every reference."""
+    all_tags = [r["tag"] for r in reference_library if r.get("tag")]
+    raw = shot.get("reference_tags")
+    if isinstance(raw, str):
+        raw = [raw]
+    if isinstance(raw, list):
+        picked = []
+        for t in raw:
+            m = re.search(r"(\d+)", str(t))
+            tag = f"<Picture {m.group(1)}>" if m else None
+            if tag in all_tags and tag not in picked:
+                picked.append(tag)
+        if picked:
+            return picked
+    return all_tags
+
+
+def _ensure_reference_tags(prompt: str, tags: list[str], reference_library: list[dict]) -> str:
+    """Fallback: if the writer dropped any tag, append an explicit reference line."""
+    missing = [t for t in tags if t not in prompt]
+    if not missing:
+        return prompt
+    by_tag = {r["tag"]: r for r in reference_library}
+    parts = [f"{by_tag[t].get('label') or by_tag[t].get('role', '').lower()} {t}".strip() for t in missing]
+    return f"{prompt.rstrip()}\nReferences: " + ", ".join(parts) + "."
 
 
 def director_generate(scene, mode, reference_files, reference_labels, total_duration, shot_duration, preset, style, camera, motion, audio, dialogue, constraints,
@@ -1947,6 +2203,11 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
         "total_duration_seconds": total, "target_shot_duration_seconds": target,
         "shot_count": count, "shot_durations_seconds": durations
     }
+    if reference_library:
+        planner_input["reference_instructions"] = (
+            "Each reference has a tag (<Picture 1>, <Picture 2>, ...). Add a 'reference_tags' list to every shot "
+            "with the tags of the references visible or relevant in that shot, and refer to references by their tag "
+            "in subject_action / prompt_notes.")
     t_d_start = time.perf_counter()
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
@@ -1963,17 +2224,25 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     timeline = 0
     prompts = []
     t_w_start = time.perf_counter()
+    seen_ids = set()
     for i, shot in enumerate(shots, 1):
-        dur = int(shot.get("duration") or durations[min(i-1, len(durations)-1)])
+        dur = parse_seconds(shot.get("duration"), durations[min(i-1, len(durations)-1)])
         dur = max(5, min(30, dur))
         shot_id = str(shot.get("shot_id") or f"SHOT_{i:02d}")
+        if shot_id in seen_ids:
+            shot_id = f"{shot_id}_{i:02d}"
+        seen_ids.add(shot_id)
         shot["shot_id"] = shot_id; shot["start_time"] = timeline; shot["end_time"] = timeline + dur; shot["duration"] = dur
         payload = {"target_workflow": mode, "workflow_target": f"MiniMax H3 ({mode})", "shot": shot, "continuity_bible": bible, "global_style": plan.get("global_style") or style,
                    "global_audio": plan.get("global_audio") or audio, "reference_library": reference_library, "user_constraints": constraints}
+        shot_tags = _director_shot_tags(shot, reference_library)
+        if shot_tags:
+            payload["reference_tags"] = shot_tags
         prompt = ollama_chat(cfg, writer_model, [
             {"role":"system","content":DIRECTOR_PROMPT_SYSTEM},
             {"role":"user","content":json.dumps(payload, ensure_ascii=False, indent=2)}
         ], tw, track_stats=stats_log, max_tokens=4096).strip()
+        prompt = _ensure_reference_tags(prompt, shot_tags, reference_library)
         prompts.append({"shot_id":shot_id,"start_time":timeline,"end_time":timeline+dur,"duration":dur,"prompt":prompt})
         timeline += dur
     t_writer = time.perf_counter() - t_w_start
@@ -2011,7 +2280,9 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     result = {"project_title":plan.get("project_title") or "Director Mode sequence", "total_duration":timeline,
               "shot_count":len(prompts), "continuity_bible":bible, "global_style":plan.get("global_style") or style,
               "global_audio":plan.get("global_audio") or audio, "storyboard":shots, "prompts":prompts,
-              "reference_library": reference_library, "timings": timings}
+              "reference_library": reference_library, "timings": timings,
+              # Same order as reference_library: position decides each image's <Picture N> tag.
+              "reference_files": [_copy_ref_to_persistent(p, "director") for p in reference_files]}
     return reference_library, result
 
 
@@ -2050,33 +2321,33 @@ def build_ui():
                 # --- Adaptive Visual References Container ---
                 # 1. Single Reference (I2VA, L2VA, T2VA)
                 with gr.Row(visible=single_visible) as single_img_row:
-                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label="Reference Image (<Image_1>)", sources=["upload", "clipboard"])
+                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label="Reference Image (<Picture 1>)", sources=["upload", "clipboard"])
 
                 # 2. Dual Reference (FLF2VA / LTX Video FLF)
                 with gr.Row(visible=flf_visible) as flf_img_row:
-                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label="First Frame (<Image_1> - Start / Initial State)", sources=["upload", "clipboard"])
-                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label="Last Frame (<Image_2> - End / Target State)", sources=["upload", "clipboard"])
+                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label="First Frame (<Picture 1> - Start / Initial State)", sources=["upload", "clipboard"])
+                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label="Last Frame (<Picture 2> - End / Target State)", sources=["upload", "clipboard"])
 
                 # 3. Multi Reference (R2V - up to 6 images)
                 saved_r2v_paths = ui_state.get("r2v_state", [])
-                saved_r2v_items = [(p, f"<Image_{i}>: {Path(p).name}") for i, p in enumerate(saved_r2v_paths, 1) if Path(p).exists()]
+                saved_r2v_items = [(p, f"<Picture {i}>: {Path(p).name}") for i, p in enumerate(saved_r2v_paths, 1) if Path(p).exists()]
                 r2v_info_md = (
-                    f"**{len(saved_r2v_items)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(saved_r2v_items) + 1)])
+                    f"**{len(saved_r2v_items)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(saved_r2v_items) + 1)])
                     if saved_r2v_items
-                    else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+                    else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
                 )
                 with gr.Column(visible=r2v_visible) as r2v_img_col:
                     r2v_state = gr.State(saved_r2v_paths)
                     r2v_selected_idx = gr.State(None)
                     r2v_file = gr.File(
-                        label="Upload Reference Images for R2V (Up to 6 images: <Image_1> to <Image_6>)",
+                        label="Upload Reference Images for R2V (Up to 6 images: <Picture 1> to <Picture 6>)",
                         file_count="multiple",
                         file_types=["image"],
                         type="filepath",
                     )
                     r2v_gallery = gr.Gallery(
                         value=saved_r2v_items,
-                        label="R2V References (<Image_1> ... <Image_6>)",
+                        label="R2V References (<Picture 1> ... <Picture 6>)",
                         show_label=True,
                         columns=3,
                         height=200,
@@ -2095,15 +2366,15 @@ def build_ui():
                         visible=r2v_visible,
                     )
                     r2v_tags_info = gr.Markdown(r2v_info_md)
-                    r2v_video_enabled = gr.Checkbox(label="🎬 Incluir Referencia de Vídeo (<Video_1>)", value=ui_state.get("r2v_video_enabled", False))
+                    r2v_video_enabled = gr.Checkbox(label="🎬 Incluir Referencia de Vídeo (<Video 1>)", value=ui_state.get("r2v_video_enabled", False))
                     r2v_video_box_visible = bool(ui_state.get("r2v_video_enabled", False))
                     with gr.Column(visible=r2v_video_box_visible) as r2v_video_box:
-                        r2v_video_file = gr.File(value=ui_state.get("r2v_video_file"), label="Archivo de Vídeo opcional (<Video_1>) — (Referencia de etiqueta, 0 VRAM)", file_count="single", file_types=["video"], type="filepath")
+                        r2v_video_file = gr.File(value=ui_state.get("r2v_video_file"), label="Archivo de Vídeo opcional (<Video 1>) — (Referencia de etiqueta, 0 VRAM)", file_count="single", file_types=["video"], type="filepath")
                         r2v_video_notes = gr.Textbox(
-                            label="Instrucción de Vídeo (<Video_1>)",
-                            placeholder="Opcional: p.ej. 'Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>'",
+                            label="Instrucción de Vídeo (<Video 1>)",
+                            placeholder="Opcional: p.ej. 'Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>'",
                             lines=2,
-                            value=ui_state.get("r2v_video_notes", "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>.")
+                            value=ui_state.get("r2v_video_notes", "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>.")
                         )
                 # ---------------------------------------------
 
@@ -2211,8 +2482,8 @@ def build_ui():
                     d_ref_labels = gr.Textbox(label="Reference roles / labels (optional)", lines=4, value=ui_state.get("d_ref_labels", ""), placeholder="One per line: captain.png | CHARACTER | Captain\nengine_room.jpg | LOCATION | U-29 engine room\nuniform.png | WARDROBE | Captain uniform")
                     with gr.Row():
                         d_mode = gr.Dropdown(MODES, value=ui_state.get("d_mode", "I2VA"), label="Target workflow")
-                        d_total = gr.Dropdown(["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"], value=ui_state.get("d_total", "30"), label="Total duration (s)")
-                        d_shot = gr.Dropdown(["5","6","8","10","12","15","18","20","25","30"], value=ui_state.get("d_shot", "8"), label="Target shot duration (s)")
+                        d_total = gr.Dropdown(DIRECTOR_TOTALS, value=ui_state.get("d_total", "30"), label="Total duration (s)")
+                        d_shot = gr.Dropdown(DIRECTOR_SHOTS, value=ui_state.get("d_shot", "8"), label="Target shot duration (s)")
                     d_preset = gr.Dropdown(PRESETS, value=ui_state.get("d_preset", "H3 Cinematic"), label="Cinematic preset")
                     d_style = gr.Textbox(label="Global style", lines=2, value=ui_state.get("d_style", PRESETS_DATA["H3 Cinematic"]["style"]))
                     d_camera = gr.Textbox(label="Camera language", lines=2, value=ui_state.get("d_camera", PRESETS_DATA["H3 Cinematic"]["camera"]))
@@ -2222,7 +2493,9 @@ def build_ui():
                     d_constraints = gr.Textbox(label="Continuity rules", lines=4, value=ui_state.get("d_constraints", "Keep character identity, wardrobe, props, location geometry, lighting direction and time of day identical between shots. Maintain screen direction and eyelines unless a motivated transition changes them."))
                     d_generate = gr.Button("Build sequence + prompts", variant="primary", size="lg")
                     d_export = gr.Button("Save Director package")
-                    d_saved = gr.Textbox(label="Saved files", interactive=False)
+                    d_saved = gr.Textbox(label="Saved files", interactive=False, lines=6, max_lines=14)
+                    d_package_selector = gr.Dropdown(choices=director_package_choices(), value=None, label="Saved Director packages", allow_custom_value=False)
+                    d_load_package = gr.Button("Load package (replaces the current sequence)")
                 with gr.Column(scale=1):
                     d_timing_display = gr.Markdown(value=ui_state.get("d_timing_display", "⏱️ **Tiempos de ejecución:** *(Aún no se ha generado ninguna secuencia)*"))
                     d_bible = gr.Code(label="Continuity Bible + Reference Library", language="json", lines=22, value=ui_state.get("d_bible", ""))
@@ -2265,14 +2538,14 @@ def build_ui():
                 if p and p not in updated and len(updated) < 6:
                     updated.append(p)
             updated = updated[:6]
-            gallery_items = [(path, f"<Image_{i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
-            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def on_r2v_selected(current_list, evt: gr.SelectData):
             idx = evt.index
             if isinstance(idx, (int, float)) and 0 <= int(idx) < len(current_list or []):
-                tag = f"<Image_{int(idx)+1}>"
+                tag = f"<Picture {int(idx)+1}>"
                 fname = Path(current_list[int(idx)]).name
                 return int(idx), gr.update(interactive=True, value=f"🗑️ Eliminar {tag} ({fname})")
             return None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
@@ -2281,17 +2554,15 @@ def build_ui():
             updated = list(current_list or [])
             if selected_idx is not None and isinstance(selected_idx, (int, float)) and 0 <= int(selected_idx) < len(updated):
                 updated.pop(int(selected_idx))
-            gallery_items = [(path, f"<Image_{i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
-            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Image_{i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*"
+            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def clear_all_r2v():
-            return [], [], None, "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Image_1>` a `<Image_6>`)*", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+            return [], [], None, "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        r2v_file.change(append_r2v_refs, inputs=[r2v_file, r2v_state], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
+        # Add/remove/clear handlers for R2V refs are registered below with state persistence.
         r2v_gallery.select(on_r2v_selected, inputs=[r2v_state], outputs=[r2v_selected_idx, r2v_remove_btn])
-        r2v_remove_btn.click(remove_selected_r2v, inputs=[r2v_selected_idx, r2v_state], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
-        r2v_clear_btn.click(clear_all_r2v, outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
         r2v_video_enabled.change(lambda v: gr.update(visible=v), inputs=r2v_video_enabled, outputs=r2v_video_box)
 
         def on_r2v_video_uploaded(file_value):
@@ -2346,7 +2617,8 @@ def build_ui():
             save_history([])
             return gr.update(choices=[], value=None), gr.update(choices=[], value=None), gr.update(choices=[], value=None)
         delete_history.click(clear_hist, outputs=[history, compare_a, compare_b])
-        d_preset.change(lambda p: apply_preset(p)[:4], inputs=d_preset, outputs=[d_style, d_camera, d_motion, d_audio])
+        # .input, not .change: loading a package sets the preset and must not overwrite its stored style fields.
+        d_preset.input(lambda p: apply_preset(p)[:4], inputs=d_preset, outputs=[d_style, d_camera, d_motion, d_audio])
 
         def generate_ref_labels_text(paths: list[str], current_labels_text: str = "") -> str:
             existing_lines_by_filename = {}
@@ -2414,46 +2686,26 @@ def build_ui():
         def clear_all_refs():
             return [], [], None, "", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
-        d_file.upload(append_d_refs, inputs=[d_file, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_refs.upload(append_d_refs, inputs=[d_refs, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        # Add/remove/clear handlers for Director refs are registered below with state persistence.
         d_refs.select(on_ref_selected, inputs=[d_ref_state], outputs=[d_selected_ref_idx, d_remove_selected])
-        d_remove_selected.click(remove_selected_ref, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_clear_refs.click(clear_all_refs, outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
 
         def run_director(*args):
             t_dir_start = time.perf_counter()
-            ref, result = director_generate(*args)
+            _, result = director_generate(*args)
             t_dir = time.perf_counter() - t_dir_start
-            choices=[p["shot_id"] for p in result.get("prompts",[])]
-            first=result.get("prompts",[])[0] if result.get("prompts") else {}
-            meta={k:first.get(k) for k in ["shot_id","start_time","end_time","duration"]} if first else {}
-            selector_update = gr.update(
-                choices=choices,
-                value=choices[0] if choices else None,
-                interactive=bool(choices),
-            )
-            timing_md = format_timing_badge(result.get("timings", {}))
+            status = f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)"
+            # Captured here rather than at save time: the package must record what produced these prompts.
+            form = dict(zip(DIRECTOR_FORM_FIELDS, (args[0], args[1], *args[4:13])))
+            result["director_form"] = form
+            persisted, outputs = director_panels(result, status)
             # Persist director UI state.
-            save_director_ui_state({
-                "d_scene": args[0], "d_mode": args[1], "d_ref_state": args[2], "d_ref_labels": args[3],
-                "d_total": args[4], "d_shot": args[5], "d_preset": args[6],
-                "d_style": args[7], "d_camera": args[8], "d_motion": args[9],
-                "d_audio": args[10], "d_dialogue": args[11], "d_constraints": args[12],
-                "director_state": result,
-                "d_bible": json.dumps({"reference_library": ref}, indent=2, ensure_ascii=False) if ref else "No reference images.",
-                "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
-                "d_prompts": director_prompt_text(result),
-                "d_status": f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",
-                "d_timing_display": timing_md,
-            })
-            return (timing_md, json.dumps({"reference_library": ref},indent=2,ensure_ascii=False) if ref else "No reference images.",
-                    json.dumps(result.get("storyboard",[]),indent=2,ensure_ascii=False),director_prompt_text(result),
-                    f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",selector_update,
-                    first.get("prompt","") if first else "",json.dumps(meta,indent=2,ensure_ascii=False),result)
+            save_director_ui_state({**form, "d_ref_state": args[2], "d_ref_labels": args[3], **persisted})
+            return outputs
+        d_panel_outputs = [d_timing_display,d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state]
         d_generate.click(run_director,
             inputs=[d_scene,d_mode,d_ref_state,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
                     backend_sel,ollama_url,vision_model,motion_model,writer_model,temperature_vision,temperature_motion,temperature_writer,num_ctx,keep_alive],
-            outputs=[d_timing_display,d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
+            outputs=d_panel_outputs)
         def show_director_shot(choice, result):
             for p in (result or {}).get("prompts", []):
                 if str(p.get("shot_id")) == str(choice):
@@ -2461,7 +2713,13 @@ def build_ui():
                     return p.get("prompt", ""), json.dumps(meta, indent=2, ensure_ascii=False)
             return "", "{}"
         d_shot_selector.change(show_director_shot, inputs=[d_shot_selector, director_state], outputs=[d_selected_prompt, d_selected_meta])
-        d_export.click(save_director, inputs=director_state, outputs=d_saved)
+        d_export.click(save_director, inputs=director_state, outputs=d_saved).then(refresh_director_package_selector, outputs=d_package_selector)
+        d_load_package.click(load_director_package, inputs=d_package_selector,
+            outputs=d_panel_outputs + [d_ref_state, d_refs, d_ref_labels, d_selected_ref_idx, d_remove_selected,
+                                       d_scene, d_mode, d_total, d_shot, d_preset, d_style, d_camera,
+                                       d_motion, d_audio, d_dialogue, d_constraints])
+        app.load(list_director_packages, outputs=d_saved)
+        app.load(refresh_director_package_selector, outputs=d_package_selector)
 
         # ---- Save UI state reactively on any meaningful input change ----
         # We define one snapshot function that collects every main-tab value.
@@ -2570,27 +2828,28 @@ def build_ui():
             return None
 
         # Persist director reference images when uploaded or removed.
-        def append_d_refs_and_save(new_files, current_list, current_labels, *rest):
+        # Each handler receives d_scene plus director_inputs_for_save[3:] and rebuilds the full
+        # (d_scene, d_ref_state, d_ref_labels, *rest) tuple expected by _make_director_state_dict.
+        d_refs_outputs = [d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected]
+
+        def append_d_refs_and_save(new_files, current_list, current_labels, scene, *rest):
             updated, gallery, _, labels, _, btn = append_d_refs(new_files, current_list, current_labels)
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_file.upload(append_d_refs_and_save, inputs=[d_file, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
-        d_refs.upload(append_d_refs_and_save, inputs=[d_refs, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_file.upload(append_d_refs_and_save, inputs=[d_file, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
+        d_refs.upload(append_d_refs_and_save, inputs=[d_refs, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
-        def remove_selected_ref_and_save(selected_idx, current_list, current_labels, *rest):
+        def remove_selected_ref_and_save(selected_idx, current_list, current_labels, scene, *rest):
             updated, gallery, _, labels, _, btn = remove_selected_ref(selected_idx, current_list, current_labels)
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_remove_selected.click(remove_selected_ref_and_save, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels] + director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_remove_selected.click(remove_selected_ref_and_save, inputs=[d_selected_ref_idx, d_ref_state, d_ref_labels, d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
-        def clear_all_refs_and_save(*rest):
+        def clear_all_refs_and_save(scene, *rest):
             updated, gallery, _, labels, _, btn = clear_all_refs()
-            args = (updated,) + rest
-            _save_director_from_inputs(*args)
+            _save_director_from_inputs(scene, updated, labels, *rest)
             return updated, gallery, None, labels, None, btn
-        d_clear_refs.click(clear_all_refs_and_save, inputs=director_inputs_for_save[3:], outputs=[d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected])
+        d_clear_refs.click(clear_all_refs_and_save, inputs=[d_scene] + director_inputs_for_save[3:], outputs=d_refs_outputs)
 
         # Text / dropdown listeners.
         for comp in (d_scene, d_ref_labels, d_mode, d_total, d_shot, d_preset, d_style, d_camera,

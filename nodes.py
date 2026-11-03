@@ -72,7 +72,7 @@ PRESETS_DATA = {
     "LTX Video FLF": {
         "style": "photorealistic LTX Video first-last frame transition, crisp temporal progression, photorealistic lighting continuity",
         "camera": "specify initial framing from First Frame, then continuous motivated camera move (dolly, pan, tilt, push-in) transitioning toward Last Frame composition",
-        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of Image 1 (FIRST_FRAME) and smoothly evolving into the pose/composition of Image 2 (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
+        "motion": "First-to-Last Frame trajectory: Describe step-by-step physical motion starting from the exact pose/composition of <Picture 1> (FIRST_FRAME) and smoothly evolving into the pose/composition of <Picture 2> (LAST_FRAME). Include secondary physical reaction, fabric dynamics, and environmental lighting shifting over time.",
         "audio": "Synchronized diegetic audio matching the physical transition from start to finish.",
         "negative": "Abrupt morphing; teleportation; frozen intermediate frames; identity drift; lighting popping; camera jumps; unwanted music; distorted limbs.",
     },
@@ -82,11 +82,11 @@ VISION_SYSTEM = """You are a forensic visual analyst for video prompting. Analyz
 
 MOTION_SYSTEM = """You are a Motion Director for generative video. Using the reference-image analysis and user intent, convert static visual elements into concrete, observable physical motion. Do not invent major subjects or locations. Avoid vague words such as 'dynamic', 'cinematic', or 'realistic' as motion instructions. Return valid JSON only with: primary_actions, subject_motion, environmental_motion, particle_motion, lighting_motion, camera_motion, physics_reactions, timing_beats, audio_events, motion_constraints. Keep motions physically plausible and temporally coherent."""
 
-WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Image_1>, <Image_2>, <Video_1>, <Audio_1>, <Audio_0>, or <Voice_1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
+WRITER_SYSTEM = """You are an expert multimodal video prompt engineer and cinematic director. Write one production-ready English prompt for the selected workflow, with MiniMax H3 or LTX Video as the primary target when selected. Preserve reference identity/composition where relevant. When reference tags such as <Picture 1>, <Picture 2>, <Video 1>, <Audio 1>, <Audio 0>, or <Voice 1> are used, strictly preserve them as functional anchors. Make physical motion explicit, assign actions to specific subjects, use coherent temporal progression, describe camera movement, and keep audio diegetic unless requested. Do not invent major objects or characters absent from the request/reference analysis. Avoid vague filler. Output only the final prompt."""
 
 DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard planner for generative video. Take a scene description, optional reference-image forensic analysis, visual style, and constraints and design a sequence of consecutive video shots. The total requested duration is divided into individual shots suitable for short video generation. Every shot must be independently usable as a video-generation prompt, but all shots must preserve the continuity bible: character identity, wardrobe, props, location geometry, lighting direction/color, time of day, atmosphere, weather and visual style. Do not invent major characters, locations or objects not supported by the scene/reference. Use motivated shot changes: establish geography before action, maintain screen direction/eyelines, and only change camera position when narratively useful. Each shot should have one clear primary action plus secondary physical motion. Avoid packing unrelated actions into the same short shot. Return valid JSON only with: project_title, continuity_bible, global_style, global_audio, shots. continuity_bible must contain: characters, wardrobe, location, props, lighting, atmosphere, camera_language, continuity_rules. Each shot must contain: shot_id, start_time, end_time, duration, purpose, framing, camera, subject_action, secondary_motion, environment_reaction, lighting, audio, dialogue, transition_note, prompt_notes."""
 
-DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. Output ONLY the prompt text."""
+DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. If the input lists reference_tags (e.g. <Picture 1>, <Picture 2>), you MUST embed each listed tag verbatim inside the prompt, right next to the subject, location or object it depicts (e.g. "the captain from <Picture 1> walks into the hangar from <Picture 2>"). Never rename, renumber, translate or drop these tags. Output ONLY the prompt text."""
 
 
 def sanitize_url(url: Optional[str]) -> str:
@@ -197,6 +197,16 @@ def extract_json(text: str) -> Dict[str, Any]:
         return {"raw_text": text}
 
 
+def parse_seconds(value: Any, default: int) -> int:
+    """Parse an LLM-provided duration such as 8, "8", "8s" or "7.5 sec" into whole seconds."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        secs = int(round(value))
+    else:
+        m = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+        secs = int(round(float(m.group()))) if m else 0
+    return secs if secs > 0 else default
+
+
 def ollama_unload_model(url: str, model: str) -> None:
     """Instruct Ollama to immediately unload a specific model from VRAM."""
     if not model:
@@ -286,24 +296,24 @@ def build_writer_prompt(
         if audio and ("<Audio" in audio or "<Voice" in audio):
             audio_text = audio
         elif audio:
-            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{audio} Explicitly synchronize all motion and diegetic audio pacing to <Audio 1>."
         else:
-            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio_1>."
+            audio_text = f"{preset_data['audio']} Explicitly synchronize all motion, rhythm and diegetic audio pacing to <Audio 1>."
     else:
         audio_text = audio or preset_data['audio']
 
     has_video = bool(custom_video and custom_video.strip()) or ("<Video" in (scene or "")) or ("<Video" in (constraints or ""))
     video_req = ""
     if has_video:
-        v_note = custom_video.strip() if (custom_video and custom_video.strip()) else "Subject motion dynamics, pacing, performance and camera tracking follow <Video_1>."
-        video_req = f"- Video anchor: `<Video_1>`. You MUST explicitly embed `<Video_1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video_1>."
+        v_note = custom_video.strip() if (custom_video and custom_video.strip()) else "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>."
+        video_req = f"- Video anchor: `<Video 1>`. You MUST explicitly embed `<Video 1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video 1>."
 
     r2v_requirement = ""
-    if mode == "R2V" or "<Audio" in (audio or "") or "<Audio" in (scene or "") or has_video:
+    if mode == "R2V":
         extra_vid = f"\n{video_req}" if has_video else ""
         r2v_requirement = f"""
 CRITICAL R2V REQUIREMENT:
-This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio_1>` (or `<Audio_0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio_1>'). If visual reference analysis is present, also reference <Image_1>.{extra_vid}
+This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio 1>` (or `<Audio 0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio 1>'). If visual reference analysis is present, also reference <Picture 1>.{extra_vid}
 NEVER omit the reference tags in the output.
 """
     elif has_video:
@@ -311,7 +321,7 @@ NEVER omit the reference tags in the output.
 CRITICAL VIDEO REFERENCE REQUIREMENT:
 A reference video is active in this generation.
 {video_req}
-NEVER omit the `<Video_1>` tag in the final prompt.
+NEVER omit the `<Video 1>` tag in the final prompt.
 """
 
     return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3 / Video Gen. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.
@@ -861,6 +871,14 @@ class H3_PromptWriter:
 # =============================================================================
 # COMFYUI NODE: H3_DirectorMode (Storyboarding & Multi-shot Sequencing)
 # =============================================================================
+def ensure_reference_tags(prompt: str, tags: List[str]) -> str:
+    """Fallback: if the writer dropped any reference tag, append an explicit reference line."""
+    missing = [t for t in tags if t not in prompt]
+    if not missing:
+        return prompt
+    return f"{prompt.rstrip()}\nReferences: " + ", ".join(missing) + "."
+
+
 class H3_DirectorMode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -933,6 +951,7 @@ class H3_DirectorMode:
         w_model = custom_writer_override.strip() or writer_model
 
         ref_analysis = None
+        ref_tags: List[str] = []
         b64_first = tensor_to_base64(first_frame_image)
         b64_last = tensor_to_base64(last_frame_image)
 
@@ -955,9 +974,10 @@ class H3_DirectorMode:
                     keep_alive="0m",
                 )
                 ref_analysis = {
-                    "first_frame": extract_json(raw_v1),
-                    "last_frame": extract_json(raw_v2),
+                    "first_frame": {"tag": "<Picture 1>", "role": "FIRST_FRAME", "analysis": extract_json(raw_v1)},
+                    "last_frame": {"tag": "<Picture 2>", "role": "LAST_FRAME", "analysis": extract_json(raw_v2)},
                 }
+                ref_tags = ["<Picture 1>", "<Picture 2>"]
             elif b64_first:
                 raw_v1 = ollama_chat(
                     ollama_url,
@@ -967,7 +987,8 @@ class H3_DirectorMode:
                     num_ctx,
                     keep_alive="0m",
                 )
-                ref_analysis = extract_json(raw_v1)
+                ref_analysis = {"tag": "<Picture 1>", "role": "REFERENCE", "analysis": extract_json(raw_v1)}
+                ref_tags = ["<Picture 1>"]
 
             if unload_models_after_gen and (b64_first or b64_last) and v_model:
                 ollama_unload_model(ollama_url, v_model)
@@ -992,6 +1013,10 @@ class H3_DirectorMode:
                 "shot_count": count,
                 "shot_durations_seconds": durations,
             }
+            if ref_tags:
+                planner_input["reference_instructions"] = (
+                    "Reference images are tagged " + ", ".join(ref_tags) + ". Refer to them by their tag "
+                    "in subject_action / prompt_notes.")
 
             raw_plan = ollama_chat(
                 ollama_url,
@@ -1014,7 +1039,7 @@ class H3_DirectorMode:
             shot_prompts = []
             timeline = 0
             for i, shot in enumerate(shots, 1):
-                dur = int(shot.get("duration") or durations[min(i - 1, len(durations) - 1)])
+                dur = parse_seconds(shot.get("duration"), durations[min(i - 1, len(durations) - 1)])
                 shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
                 shot["shot_id"] = shot_id
                 shot["duration"] = dur
@@ -1027,6 +1052,8 @@ class H3_DirectorMode:
                     "reference_analysis": ref_analysis,
                     "user_constraints": custom_constraints,
                 }
+                if ref_tags:
+                    payload["reference_tags"] = ref_tags
                 prompt = ollama_chat(
                     ollama_url,
                     w_model,
@@ -1038,6 +1065,7 @@ class H3_DirectorMode:
                     num_ctx,
                     keep_alive="0m",
                 ).strip()
+                prompt = ensure_reference_tags(prompt, ref_tags)
                 shot_prompts.append(prompt)
                 timeline += dur
 
