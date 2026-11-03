@@ -36,6 +36,12 @@ DEFAULT_CONFIG = {
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
 PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
+DIRECTOR_TOTALS = ["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"]
+DIRECTOR_SHOTS = ["5","6","8","10","12","15","18","20","25","30"]
+# Director form values stored with each sequence, so a loaded package can be rebuilt as it was made.
+DIRECTOR_FORM_FIELDS = ("d_scene", "d_mode", "d_total", "d_shot", "d_preset", "d_style", "d_camera",
+                        "d_motion", "d_audio", "d_dialogue", "d_constraints")
+DIRECTOR_FORM_CHOICES = {"d_mode": MODES, "d_total": DIRECTOR_TOTALS, "d_shot": DIRECTOR_SHOTS, "d_preset": PRESETS}
 
 PRESETS_DATA = {
     "H3 Cinematic": {
@@ -1858,9 +1864,194 @@ def save_text(kind: str, text: str) -> str:
     return f"Saved: {latest_path.name} | Archived: archive/{archive_path.name}"
 
 
+def _director_package_dirs() -> list[Path]:
+    """Saved Director package directories, newest first."""
+    root = ROOT / "outputs" / "director_packages"
+    return sorted((p for p in root.glob("package_*") if p.is_dir()), key=lambda p: p.name, reverse=True)
+
+
+def director_package_choices() -> list[tuple[str, str]]:
+    """(label, package name) pairs for the Director package selector."""
+    choices = []
+    for pkg in _director_package_dirs():
+        try:
+            data = json.loads((pkg / "director_sequence.json").read_text(encoding="utf-8"))
+            label = f"{pkg.name} — {data.get('project_title') or 'Untitled'} ({data.get('shot_count', 0)} shots, {data.get('total_duration', 0)}s)"
+        except (OSError, ValueError, AttributeError):
+            label = f"{pkg.name} — (unreadable)"
+        choices.append((label, pkg.name))
+    return choices
+
+
+def refresh_director_package_selector():
+    return gr.update(choices=director_package_choices())
+
+
+def director_panels(result: Dict[str, Any], status: str) -> tuple[Dict[str, Any], tuple]:
+    """Build the Director result panels from a sequence.
+
+    Returns (fields to persist in ui_state, values for the panel outputs). Shared by a
+    fresh build and a loaded package so both leave the tab in the same state.
+    """
+    prompts = result.get("prompts", [])
+    ref = result.get("reference_library")
+    persisted = {
+        "director_state": result,
+        "d_bible": json.dumps({"reference_library": ref}, indent=2, ensure_ascii=False) if ref else "No reference images.",
+        "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
+        "d_prompts": director_prompt_text(result),
+        "d_status": status,
+        "d_timing_display": format_timing_badge(result.get("timings", {})),
+    }
+    choices = [str(p.get("shot_id") or f"SHOT_{i:02d}") for i, p in enumerate(prompts, 1)]
+    first = prompts[0] if prompts else {}
+    meta = {k: first.get(k) for k in ["shot_id", "start_time", "end_time", "duration"]} if first else {}
+    selector_update = gr.update(choices=choices, value=choices[0] if choices else None, interactive=bool(choices))
+    outputs = (
+        persisted["d_timing_display"], persisted["d_bible"], persisted["d_storyboard"], persisted["d_prompts"],
+        status, selector_update, first.get("prompt", ""), json.dumps(meta, indent=2, ensure_ascii=False), result,
+    )
+    return persisted, outputs
+
+
+def _find_ui_ref(name: str) -> Optional[Path]:
+    """Find a reference in outputs/ui_refs by its name, with or without the content-hash prefix."""
+    if not name or not UI_REFS_DIR.is_dir():
+        return None
+    pattern = re.compile(r"(?:[0-9a-f]{12}_)?" + re.escape(name))
+    matches = [p for p in UI_REFS_DIR.rglob("*") if p.is_file() and pattern.fullmatch(p.name)]
+    # Prefer Director's own copies; the hash prefix can hide same-named files, so newest wins.
+    return max(matches, key=lambda p: (p.parent.name == "director", p.stat().st_mtime), default=None)
+
+
+def _reference_name(result: Dict[str, Any], index: int) -> str:
+    """Bare file name of reference `index`. Packages saved before images were archived only have `filename`."""
+    files = result.get("reference_files") or []
+    stored = files[index] if index < len(files) else None
+    return Path(str(stored or result["reference_library"][index].get("filename") or "")).name
+
+
+def _archive_references(result: Dict[str, Any], pkg_dir: Path) -> list[str]:
+    """Copy the sequence's reference images into the package. Returns the names that could not be copied."""
+    failed = []
+    files = result.get("reference_files") or []
+    for i in range(len(result.get("reference_library") or [])):
+        name = _reference_name(result, i)
+        stored = Path(files[i]) if i < len(files) and files[i] else None
+        src = stored if stored and stored.is_file() else _find_ui_ref(name)
+        try:
+            if src is None:
+                raise FileNotFoundError(name)
+            (pkg_dir / "refs").mkdir(exist_ok=True)
+            shutil.copy2(src, pkg_dir / "refs" / name)
+        except OSError:
+            failed.append(name)
+    return failed
+
+
+def restore_package_references(pkg: Path, result: Dict[str, Any]) -> tuple[list[Optional[str]], str, list[str]]:
+    """Locate a package's reference images.
+
+    Only looks inside the package and outputs/ui_refs, never at paths stored in its JSON.
+    Returns (one path or None per reference, labels text for the found ones, missing names).
+    """
+    paths: list[Optional[str]] = []
+    labels = []
+    missing = []
+    for i, ref in enumerate(result.get("reference_library") or []):
+        name = _reference_name(result, i)
+        packaged = pkg / "refs" / name if name else None
+        if packaged and packaged.is_file():
+            # Keep the name: copying through _copy_ref_to_persistent would stack another hash prefix.
+            found = UI_REFS_DIR / "director" / name
+            if not found.exists():
+                found.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(packaged, found)
+        else:
+            found = _find_ui_ref(name)
+        if found is None:
+            paths.append(None)
+            missing.append(name or str(ref.get("reference_id")))
+            continue
+        paths.append(str(found))
+        labels.append(f"{found.name} | {ref.get('role') or 'GENERAL'} | {ref.get('label') or found.stem}")
+    return paths, "\n".join(labels), missing
+
+
+def restore_package_form(result: Dict[str, Any]) -> tuple[Dict[str, str], list[str]]:
+    """Valid form values stored in a package, and the fields that have to keep their current value.
+
+    Dropdown values are checked because Gradio rejects the next event if one is not among its choices.
+    """
+    form = result.get("director_form")
+    form = form if isinstance(form, dict) else {}
+    values = {}
+    for field in DIRECTOR_FORM_FIELDS:
+        value = form.get(field)
+        allowed = DIRECTOR_FORM_CHOICES.get(field)
+        if isinstance(value, str) and (allowed is None or value in allowed):
+            values[field] = value
+    return values, [f for f in DIRECTOR_FORM_FIELDS if f not in values]
+
+
+def load_director_package(name: Optional[str]):
+    """Restore a saved package into the Director panels, reference gallery and form.
+
+    On failure only the status changes.
+    """
+    def failed(message: str) -> tuple:
+        return (gr.update(),) * 4 + (message,) + (gr.update(),) * (9 + len(DIRECTOR_FORM_FIELDS))
+
+    if not name:
+        return failed("Select a saved package to load.")
+    # Match against what is on disk so the name can never address a path outside director_packages.
+    pkg = next((p for p in _director_package_dirs() if p.name == name), None)
+    if pkg is None:
+        return failed(f"Package not found: {name}")
+    try:
+        result = json.loads((pkg / "director_sequence.json").read_text(encoding="utf-8"))
+        ref_paths, ref_labels, missing = restore_package_references(pkg, result)
+        result["reference_files"] = ref_paths  # so saving this sequence again archives the images too
+        found = [p for p in ref_paths if p]
+        status = f"Loaded {name} — {result.get('shot_count', 0)} shots / {result.get('total_duration', 0)}s"
+        if ref_paths:
+            status += f" · {len(found)}/{len(ref_paths)} reference images"
+        if missing:
+            status += f" · MISSING (<Picture N> numbering may shift if you rebuild): {', '.join(missing)}"
+        form, form_kept = restore_package_form(result)
+        if not form:
+            status += " · form not stored in this package: current values kept"
+        elif form_kept:
+            status += f" · current values kept for: {', '.join(form_kept)}"
+        persisted, outputs = director_panels(result, status)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return failed(f"Could not load {name}: {exc}")
+    save_director_ui_state({**persisted, **form, "d_ref_state": found, "d_ref_labels": ref_labels})
+    form_outputs = tuple(form.get(f, gr.update()) for f in DIRECTOR_FORM_FIELDS)
+    return outputs + (found, found, ref_labels, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs
+
+
+def list_director_packages(limit: int = 20) -> str:
+    """Describe the saved Director packages on disk, newest first."""
+    packages = _director_package_dirs()
+    if not packages:
+        return "No saved Director packages yet."
+    blocks = []
+    for pkg in packages[:limit]:
+        entries = sorted(f.name for f in pkg.iterdir() if f.is_file())
+        if (pkg / "refs").is_dir():
+            entries.append(f"refs/ ({sum(1 for f in (pkg / 'refs').iterdir() if f.is_file())} images)")
+        files = ", ".join(entries) or "(empty)"
+        blocks.append(f"outputs/director_packages/{pkg.name}/\n  {files}")
+    hidden = len(packages) - limit
+    if hidden > 0:
+        blocks.append(f"... and {hidden} older package(s) in outputs/director_packages/")
+    return "\n".join(blocks)
+
+
 def save_director(result):
     if not result:
-        return "No director package to save."
+        return f"No director package to save.\n\n{list_director_packages()}"
     out = ROOT / "outputs"
     out.mkdir(exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1886,7 +2077,9 @@ def save_director(result):
         (shots_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
         (pkg_dir / shot_filename).write_text(p["prompt"], encoding="utf-8")
 
-    return f"Saved in outputs/ and archived in: outputs/director_packages/package_{timestamp}/"
+    not_archived = _archive_references(result, pkg_dir)
+    warning = f"\nReference images NOT archived: {', '.join(not_archived)}" if not_archived else ""
+    return f"Saved in outputs/ and archived in: outputs/director_packages/package_{timestamp}/{warning}\n\n{list_director_packages()}"
 
 
 def apply_preset(preset):
@@ -2087,7 +2280,9 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     result = {"project_title":plan.get("project_title") or "Director Mode sequence", "total_duration":timeline,
               "shot_count":len(prompts), "continuity_bible":bible, "global_style":plan.get("global_style") or style,
               "global_audio":plan.get("global_audio") or audio, "storyboard":shots, "prompts":prompts,
-              "reference_library": reference_library, "timings": timings}
+              "reference_library": reference_library, "timings": timings,
+              # Same order as reference_library: position decides each image's <Picture N> tag.
+              "reference_files": [_copy_ref_to_persistent(p, "director") for p in reference_files]}
     return reference_library, result
 
 
@@ -2287,8 +2482,8 @@ def build_ui():
                     d_ref_labels = gr.Textbox(label="Reference roles / labels (optional)", lines=4, value=ui_state.get("d_ref_labels", ""), placeholder="One per line: captain.png | CHARACTER | Captain\nengine_room.jpg | LOCATION | U-29 engine room\nuniform.png | WARDROBE | Captain uniform")
                     with gr.Row():
                         d_mode = gr.Dropdown(MODES, value=ui_state.get("d_mode", "I2VA"), label="Target workflow")
-                        d_total = gr.Dropdown(["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"], value=ui_state.get("d_total", "30"), label="Total duration (s)")
-                        d_shot = gr.Dropdown(["5","6","8","10","12","15","18","20","25","30"], value=ui_state.get("d_shot", "8"), label="Target shot duration (s)")
+                        d_total = gr.Dropdown(DIRECTOR_TOTALS, value=ui_state.get("d_total", "30"), label="Total duration (s)")
+                        d_shot = gr.Dropdown(DIRECTOR_SHOTS, value=ui_state.get("d_shot", "8"), label="Target shot duration (s)")
                     d_preset = gr.Dropdown(PRESETS, value=ui_state.get("d_preset", "H3 Cinematic"), label="Cinematic preset")
                     d_style = gr.Textbox(label="Global style", lines=2, value=ui_state.get("d_style", PRESETS_DATA["H3 Cinematic"]["style"]))
                     d_camera = gr.Textbox(label="Camera language", lines=2, value=ui_state.get("d_camera", PRESETS_DATA["H3 Cinematic"]["camera"]))
@@ -2298,7 +2493,9 @@ def build_ui():
                     d_constraints = gr.Textbox(label="Continuity rules", lines=4, value=ui_state.get("d_constraints", "Keep character identity, wardrobe, props, location geometry, lighting direction and time of day identical between shots. Maintain screen direction and eyelines unless a motivated transition changes them."))
                     d_generate = gr.Button("Build sequence + prompts", variant="primary", size="lg")
                     d_export = gr.Button("Save Director package")
-                    d_saved = gr.Textbox(label="Saved files", interactive=False)
+                    d_saved = gr.Textbox(label="Saved files", interactive=False, lines=6, max_lines=14)
+                    d_package_selector = gr.Dropdown(choices=director_package_choices(), value=None, label="Saved Director packages", allow_custom_value=False)
+                    d_load_package = gr.Button("Load package (replaces the current sequence)")
                 with gr.Column(scale=1):
                     d_timing_display = gr.Markdown(value=ui_state.get("d_timing_display", "⏱️ **Tiempos de ejecución:** *(Aún no se ha generado ninguna secuencia)*"))
                     d_bible = gr.Code(label="Continuity Bible + Reference Library", language="json", lines=22, value=ui_state.get("d_bible", ""))
@@ -2420,7 +2617,8 @@ def build_ui():
             save_history([])
             return gr.update(choices=[], value=None), gr.update(choices=[], value=None), gr.update(choices=[], value=None)
         delete_history.click(clear_hist, outputs=[history, compare_a, compare_b])
-        d_preset.change(lambda p: apply_preset(p)[:4], inputs=d_preset, outputs=[d_style, d_camera, d_motion, d_audio])
+        # .input, not .change: loading a package sets the preset and must not overwrite its stored style fields.
+        d_preset.input(lambda p: apply_preset(p)[:4], inputs=d_preset, outputs=[d_style, d_camera, d_motion, d_audio])
 
         def generate_ref_labels_text(paths: list[str], current_labels_text: str = "") -> str:
             existing_lines_by_filename = {}
@@ -2493,38 +2691,21 @@ def build_ui():
 
         def run_director(*args):
             t_dir_start = time.perf_counter()
-            ref, result = director_generate(*args)
+            _, result = director_generate(*args)
             t_dir = time.perf_counter() - t_dir_start
-            choices=[p["shot_id"] for p in result.get("prompts",[])]
-            first=result.get("prompts",[])[0] if result.get("prompts") else {}
-            meta={k:first.get(k) for k in ["shot_id","start_time","end_time","duration"]} if first else {}
-            selector_update = gr.update(
-                choices=choices,
-                value=choices[0] if choices else None,
-                interactive=bool(choices),
-            )
-            timing_md = format_timing_badge(result.get("timings", {}))
+            status = f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)"
+            # Captured here rather than at save time: the package must record what produced these prompts.
+            form = dict(zip(DIRECTOR_FORM_FIELDS, (args[0], args[1], *args[4:13])))
+            result["director_form"] = form
+            persisted, outputs = director_panels(result, status)
             # Persist director UI state.
-            save_director_ui_state({
-                "d_scene": args[0], "d_mode": args[1], "d_ref_state": args[2], "d_ref_labels": args[3],
-                "d_total": args[4], "d_shot": args[5], "d_preset": args[6],
-                "d_style": args[7], "d_camera": args[8], "d_motion": args[9],
-                "d_audio": args[10], "d_dialogue": args[11], "d_constraints": args[12],
-                "director_state": result,
-                "d_bible": json.dumps({"reference_library": ref}, indent=2, ensure_ascii=False) if ref else "No reference images.",
-                "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
-                "d_prompts": director_prompt_text(result),
-                "d_status": f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",
-                "d_timing_display": timing_md,
-            })
-            return (timing_md, json.dumps({"reference_library": ref},indent=2,ensure_ascii=False) if ref else "No reference images.",
-                    json.dumps(result.get("storyboard",[]),indent=2,ensure_ascii=False),director_prompt_text(result),
-                    f"Director OK — {result.get('shot_count',0)} shots / {result.get('total_duration',0)}s (⏱️ {t_dir:.1f}s)",selector_update,
-                    first.get("prompt","") if first else "",json.dumps(meta,indent=2,ensure_ascii=False),result)
+            save_director_ui_state({**form, "d_ref_state": args[2], "d_ref_labels": args[3], **persisted})
+            return outputs
+        d_panel_outputs = [d_timing_display,d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state]
         d_generate.click(run_director,
             inputs=[d_scene,d_mode,d_ref_state,d_ref_labels,d_total,d_shot,d_preset,d_style,d_camera,d_motion,d_audio,d_dialogue,d_constraints,
                     backend_sel,ollama_url,vision_model,motion_model,writer_model,temperature_vision,temperature_motion,temperature_writer,num_ctx,keep_alive],
-            outputs=[d_timing_display,d_bible,d_storyboard,d_prompts,d_status,d_shot_selector,d_selected_prompt,d_selected_meta,director_state])
+            outputs=d_panel_outputs)
         def show_director_shot(choice, result):
             for p in (result or {}).get("prompts", []):
                 if str(p.get("shot_id")) == str(choice):
@@ -2532,7 +2713,13 @@ def build_ui():
                     return p.get("prompt", ""), json.dumps(meta, indent=2, ensure_ascii=False)
             return "", "{}"
         d_shot_selector.change(show_director_shot, inputs=[d_shot_selector, director_state], outputs=[d_selected_prompt, d_selected_meta])
-        d_export.click(save_director, inputs=director_state, outputs=d_saved)
+        d_export.click(save_director, inputs=director_state, outputs=d_saved).then(refresh_director_package_selector, outputs=d_package_selector)
+        d_load_package.click(load_director_package, inputs=d_package_selector,
+            outputs=d_panel_outputs + [d_ref_state, d_refs, d_ref_labels, d_selected_ref_idx, d_remove_selected,
+                                       d_scene, d_mode, d_total, d_shot, d_preset, d_style, d_camera,
+                                       d_motion, d_audio, d_dialogue, d_constraints])
+        app.load(list_director_packages, outputs=d_saved)
+        app.load(refresh_director_package_selector, outputs=d_package_selector)
 
         # ---- Save UI state reactively on any meaningful input change ----
         # We define one snapshot function that collects every main-tab value.
