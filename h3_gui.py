@@ -428,7 +428,7 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
         except Exception:
             models = []
         # Ensure known fallbacks and newly-downloaded GGUFs are selectable.
-        fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b", "qwen3.8-27b"]
+        fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b"]
         for m in fallback:
             if m not in models:
                 models.append(m)
