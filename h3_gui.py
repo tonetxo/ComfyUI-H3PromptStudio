@@ -1894,10 +1894,10 @@ def director_panels(result: Dict[str, Any], status: str) -> tuple[Dict[str, Any]
     fresh build and a loaded package so both leave the tab in the same state.
     """
     prompts = result.get("prompts", [])
-    ref = result.get("reference_library")
+    bible = {"continuity_bible": result.get("continuity_bible") or {}, "reference_library": result.get("reference_library") or []}
     persisted = {
         "director_state": result,
-        "d_bible": json.dumps({"reference_library": ref}, indent=2, ensure_ascii=False) if ref else "No reference images.",
+        "d_bible": json.dumps(bible, indent=2, ensure_ascii=False),
         "d_storyboard": json.dumps(result.get("storyboard", []), indent=2, ensure_ascii=False),
         "d_prompts": director_prompt_text(result),
         "d_status": status,
