@@ -32,8 +32,9 @@ The same pipeline exists in three separately maintained copies that have drifted
 `config.json` → `backend` selects `"ollama"` or `"llamacpp"`; the URL is always stored in `ollama_url` even for llama.cpp (currently `http://127.0.0.1:8080`).
 
 - **ollama**: models from `GET /api/tags`; calls via `/api/chat` / `/api/generate`; `keep_alive` and `num_ctx` apply; explicit unload helpers (`ollama_unload_model`, `ollama_unload_all`).
-- **llamacpp**: OpenAI-compatible router at `/v1/models` and `/v1/chat/completions` (`llamacpp_chat_completion`), with thinking disabled via `chat_template_kwargs`. `keep_alive` does not apply (server sleeps idle models). Model list = router models + a hardcoded fallback list + `.gguf` files scanned from `/home/tonetxo/gguf-models`. `_resolve_llamacpp_model` maps aliases.
-- "Rescan" runs `~/.config/h3ps/rescan_llamacpp_models.py` (regenerates `~/.config/h3ps/llamacpp-models.ini`) and then `systemctl --user restart h3ps-llamacpp.service`. These machine-specific paths are hardcoded in both `h3_gui.py` and the custom node's `__init__.py`.
+- **llamacpp**: OpenAI-compatible router at `/v1/models` and `/v1/chat/completions` (`llamacpp_chat_completion`), with thinking disabled via `chat_template_kwargs`. `keep_alive` does not apply (server sleeps idle models). Model list = router models + `.gguf` files from the optional `gguf_models_dir`. `_resolve_llamacpp_model` maps aliases.
+- "Rescan" re-queries the server, after running `llamacpp_rescan_command` if set.
+- Per-machine options live in the optional `~/.config/h3ps/settings.json` (`gguf_models_dir`, `llamacpp_rescan_command`, `llamacpp_url`, `llamacpp_extra_models`), read by `h3_gui.py` and the custom node pack; see `README_GUI.md`. Never hardcode machine paths or model names in the code.
 
 `ollama_chat()` is the single entry point used by the pipeline; it dispatches to llama.cpp when `backend == "llamacpp"`.
 

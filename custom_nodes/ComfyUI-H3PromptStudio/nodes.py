@@ -133,35 +133,38 @@ def get_ollama_models(url: str = "http://127.0.0.1:11434") -> List[str]:
     ]
 
 
-LLAMACPP_MODELS = [
-    "gemma4-e4b-obliterated",
-    "minimax-enhancer",
-    "qwen2.1-pe-t2i",
-    "qwen2.1-pe-i2i",
-    "qwen3.5-9b",
-    "qwen3.8-27b",
-]
+LOCAL_SETTINGS_PATH = Path.home() / ".config" / "h3ps" / "settings.json"
+DEFAULT_LLAMACPP_URL = "http://127.0.0.1:8080"
+NO_LLAMACPP_MODELS = "(no llama.cpp models found)"
 
-GGUF_MODELS_DIR = Path("/home/tonetxo/gguf-models")
+
+def load_local_settings() -> Dict[str, Any]:
+    """Optional per-machine settings, shared with the standalone GUI."""
+    try:
+        data = json.loads(LOCAL_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _scan_gguf_models() -> List[str]:
-    """Fallback scan of /home/tonetxo/gguf-models for .gguf files."""
-    found = []
-    if not GGUF_MODELS_DIR.exists():
-        return found
-    for subdir in sorted(GGUF_MODELS_DIR.iterdir()):
-        if not subdir.is_dir():
-            continue
-        for p in sorted(subdir.glob("*.gguf")):
-            if "mmproj" not in p.name.lower():
-                found.append(p.stem)
+    """List the .gguf files under the optional gguf_models_dir setting."""
+    models_dir = load_local_settings().get("gguf_models_dir")
+    if not models_dir:
+        return []
+    found = {p.stem for p in Path(models_dir).expanduser().rglob("*.gguf") if "mmproj" not in p.name.lower()}
     return sorted(found)
 
 
-def get_llamacpp_models(url: str = "http://127.0.0.1:8080") -> List[str]:
-    """Fetch live models from llama.cpp router and ensure known fallbacks exist."""
-    clean_url = sanitize_url(url)
+def get_llamacpp_models(url: Optional[str] = None) -> List[str]:
+    """List the server's models plus any from the optional local settings.
+
+    ComfyUI rejects a saved combo value that is not listed, even on a hidden widget, so
+    llamacpp_extra_models keeps saved workflows valid while the server is down, and the
+    list is never empty.
+    """
+    settings = load_local_settings()
+    clean_url = sanitize_url(url or settings.get("llamacpp_url") or DEFAULT_LLAMACPP_URL)
     models = []
     try:
         r = requests.get(clean_url + "/v1/models", timeout=3)
@@ -169,10 +172,10 @@ def get_llamacpp_models(url: str = "http://127.0.0.1:8080") -> List[str]:
             models = sorted([m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()])
     except Exception:
         pass
-    for m in LLAMACPP_MODELS + _scan_gguf_models():
+    for m in list(settings.get("llamacpp_extra_models") or []) + _scan_gguf_models():
         if m not in models:
             models.append(m)
-    return models
+    return models or [NO_LLAMACPP_MODELS]
 
 
 def _resolve_llamacpp_model(model: str) -> str:
@@ -207,6 +210,13 @@ def pick_default_models(models: List[str]) -> Tuple[str, str, str]:
                 break
 
     return vision_default, text_default, text_default
+
+
+def llamacpp_combo(role: str) -> Tuple[List[str], Dict[str, str]]:
+    """Build a llama.cpp model widget whose default is always one of the listed models."""
+    models = get_llamacpp_models()
+    vision_default, text_default, _ = pick_default_models(models)
+    return (models, {"default": vision_default if role == "vision" else text_default})
 
 
 def effective_model(ollama_model: str, llamacpp_model: str, backend: str) -> str:
@@ -510,9 +520,9 @@ class H3_PromptStudio_Unified:
                 "vision_model": (models, {"default": def_vision}),
                 "motion_model": (models, {"default": def_motion}),
                 "writer_model": (models, {"default": def_writer}),
-                "vision_model_llamacpp": (get_llamacpp_models(), {"default": "gemma4-e4b-obliterated"}),
-                "motion_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
-                "writer_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
+                "vision_model_llamacpp": llamacpp_combo("vision"),
+                "motion_model_llamacpp": llamacpp_combo("text"),
+                "writer_model_llamacpp": llamacpp_combo("text"),
                 "temp_vision": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "temp_motion": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "temp_writer": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -767,7 +777,7 @@ class H3_VisionAnalyzer:
             "required": {
                 "first_frame_image": ("IMAGE",),
                 "vision_model": (models, {"default": def_vision}),
-                "vision_model_llamacpp": (get_llamacpp_models(), {"default": "gemma4-e4b-obliterated"}),
+                "vision_model_llamacpp": llamacpp_combo("vision"),
                 "temperature": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
@@ -841,7 +851,7 @@ class H3_MotionDirector:
                 "workflow_mode": (MODES, {"default": "I2VA"}),
                 "duration": (DURATIONS, {"default": "10s"}),
                 "motion_model": (models, {"default": def_motion}),
-                "motion_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
+                "motion_model_llamacpp": llamacpp_combo("text"),
                 "temperature": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
@@ -921,7 +931,7 @@ class H3_PromptWriter:
                 "duration": (DURATIONS, {"default": "10s"}),
                 "aspect_ratio": (ASPECT_RATIOS, {"default": "16:9"}),
                 "writer_model": (models, {"default": def_writer}),
-                "writer_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
+                "writer_model_llamacpp": llamacpp_combo("text"),
                 "temperature": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
             },
@@ -1041,8 +1051,8 @@ class H3_DirectorMode:
                 "workflow_mode": (MODES, {"default": "I2VA"}),
                 "director_model": (models, {"default": def_director}),
                 "writer_model": (models, {"default": def_writer}),
-                "director_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
-                "writer_model_llamacpp": (get_llamacpp_models(), {"default": "qwen2.1-pe-t2i"}),
+                "director_model_llamacpp": llamacpp_combo("text"),
+                "writer_model_llamacpp": llamacpp_combo("text"),
                 "temp_director": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "temp_writer": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "num_ctx": ("INT", {"default": 32768, "min": 2048, "max": 131072, "step": 1024}),
@@ -1052,7 +1062,7 @@ class H3_DirectorMode:
                 "first_frame_image": ("IMAGE",),
                 "last_frame_image": ("IMAGE",),
                 "vision_model": (models, {"default": def_vision}),
-                "vision_model_llamacpp": (get_llamacpp_models(), {"default": "gemma4-e4b-obliterated"}),
+                "vision_model_llamacpp": llamacpp_combo("vision"),
                 "ollama_url": ("STRING", {"default": "http://127.0.0.1:11434"}),
                 "backend": (BACKENDS, {"default": "ollama"}),
                 "custom_director_override": ("STRING", {"default": ""}),

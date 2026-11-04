@@ -60,7 +60,7 @@ cd ComfyUI-H3PromptStudio
 
 The script creates a `.venv`, installs `requirements-gui.txt` and opens the app, by default at `http://127.0.0.1:7860` (or the next free port). See [README_GUI.md](README_GUI.md) and [DIRECTOR_MODE.md](DIRECTOR_MODE.md).
 
-> **Note:** the llama.cpp `.gguf` scan and the "Rescan" button are tied to the author's machine (hardcoded paths and a `h3ps-llamacpp.service` user unit). Elsewhere the scan finds nothing and Rescan reports an error, so models come from the llama.cpp server's `/v1/models` and the built-in fallback list.
+With llama.cpp, models come from your server's `/v1/models`. Scanning a `.gguf` folder and running a command from the "Rescan" button are optional: see [Optional local settings](README_GUI.md#ajustes-locales-opcionales).
 
 ---
 

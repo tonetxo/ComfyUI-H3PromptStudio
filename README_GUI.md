@@ -110,7 +110,27 @@ Ollama:    http://127.0.0.1:11434
 llama.cpp: http://127.0.0.1:8080
 ```
 
-Con Ollama, la GUI utiliza los modelos que encuentre instalados. Con llama.cpp, combina los modelos del servidor (`/v1/models`) con una lista de respaldo fija. El escaneo de `.gguf` y el botón de reescaneo dependen de la máquina del autor (rutas fijas y el servicio de usuario `h3ps-llamacpp.service`): en otro equipo el escaneo no encuentra nada y el reescaneo devuelve un error.
+No hay modelos hardcodeados: la GUI utiliza los que liste el servidor (`/api/tags` en Ollama, `/v1/models` en llama.cpp). Sin más configuración, **Rescan llama.cpp models** vuelve a consultar el servidor.
+
+## Ajustes locales opcionales
+
+Para ajustes propios de cada máquina, crea `~/.config/h3ps/settings.json`. Lo leen la GUI y los nodos de `custom_nodes/ComfyUI-H3PromptStudio`, y todas las claves son opcionales:
+
+```json
+{
+  "gguf_models_dir": "~/gguf-models",
+  "llamacpp_rescan_command": "systemctl --user restart mi-llamacpp.service",
+  "llamacpp_url": "http://127.0.0.1:8080",
+  "llamacpp_extra_models": ["mi-alias"]
+}
+```
+
+| Clave | Qué hace | Dónde |
+|---|---|---|
+| `gguf_models_dir` | Añade a la lista los `.gguf` de esta carpeta y sus subcarpetas | GUI y nodos |
+| `llamacpp_rescan_command` | Comando que ejecuta el botón de reescaneo. Se lanza sin shell, así que para encadenar varios pasos usa un script | GUI y nodos |
+| `llamacpp_url` | URL del servidor. La GUI usa la de su campo `URL` | Nodos |
+| `llamacpp_extra_models` | Modelos que se listan siempre, para que los workflows guardados sigan siendo válidos con el servidor apagado | Nodos |
 
 ## Director Mode
 

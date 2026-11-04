@@ -4,11 +4,12 @@ import base64
 import hashlib
 import json
 import math
+import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -409,37 +410,33 @@ def save_config(cfg: Dict[str, Any]) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-RESCAN_SCRIPT = Path("/home/tonetxo/.config/h3ps/rescan_llamacpp_models.py")
-GGUF_MODELS_DIR = Path("/home/tonetxo/gguf-models")
+LOCAL_SETTINGS_PATH = Path.home() / ".config" / "h3ps" / "settings.json"
+
+
+def load_local_settings() -> Dict[str, Any]:
+    """Optional per-machine settings, shared with the ComfyUI node pack. See README_GUI.md."""
+    try:
+        data = json.loads(LOCAL_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _scan_gguf_models() -> list[str]:
-    """Fallback scan of /home/tonetxo/gguf-models for .gguf files."""
-    found = []
-    if not GGUF_MODELS_DIR.exists():
-        return found
-    for subdir in sorted(GGUF_MODELS_DIR.iterdir()):
-        if not subdir.is_dir():
-            continue
-        for p in sorted(subdir.glob("*.gguf")):
-            if "mmproj" not in p.name.lower():
-                found.append(p.stem)
+    """List the .gguf files under the optional gguf_models_dir setting."""
+    models_dir = load_local_settings().get("gguf_models_dir")
+    if not models_dir:
+        return []
+    found = {p.stem for p in Path(models_dir).expanduser().rglob("*.gguf") if "mmproj" not in p.name.lower()}
     return sorted(found)
 
 
 def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
     if backend == "llamacpp":
-        try:
-            r = requests.get(url.rstrip("/") + "/v1/models", timeout=5)
-            r.raise_for_status()
-            models = [m.get("id", "").strip() for m in r.json().get("data", [])]
-        except Exception:
-            models = []
-        # Ensure known fallbacks and newly-downloaded GGUFs are selectable.
-        fallback = ["gemma4-e4b-obliterated", "minimax-enhancer", "qwen2.1-pe-t2i", "qwen2.1-pe-i2i", "qwen3.5-9b"]
-        for m in fallback:
-            if m not in models:
-                models.append(m)
+        r = requests.get(url.rstrip("/") + "/v1/models", timeout=5)
+        r.raise_for_status()
+        models = [m.get("id", "").strip() for m in r.json().get("data", [])]
+        # Downloaded GGUFs stay selectable even if the server does not list them yet.
         for m in _scan_gguf_models():
             if m not in models:
                 models.append(m)
@@ -450,29 +447,30 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
     return sorted([m for m in models if m])
 
 
-def rescan_llamacpp_models() -> str:
-    """Regenerate router preset, restart router, and wait for it to come up."""
-    try:
-        if RESCAN_SCRIPT.exists():
-            subprocess.run([sys.executable, str(RESCAN_SCRIPT)], check=True, timeout=60)
-        subprocess.run(["systemctl", "--user", "restart", "h3ps-llamacpp.service"], check=True, timeout=180)
-    except subprocess.CalledProcessError as e:
-        return f"Rescan failed: {e}"
-    except Exception as e:
-        return f"Rescan error: {e}"
-
-    # Wait for the router to become ready
-    url = "http://127.0.0.1:8080/v1/models"
-    for _ in range(40):
+def rescan_llamacpp_models(url: str) -> str:
+    """Run the optional llamacpp_rescan_command setting, then report what the server lists."""
+    command = (load_local_settings().get("llamacpp_rescan_command") or "").strip()
+    if command:
         try:
-            r = requests.get(url, timeout=2)
+            subprocess.run([os.path.expanduser(arg) for arg in shlex.split(command)], check=True, timeout=180)
+        except subprocess.CalledProcessError as e:
+            return f"Rescan failed: {e}"
+        except Exception as e:
+            return f"Rescan error: {e}"
+
+    # A command may have restarted the server, so give it time to come back up.
+    models_url = url.rstrip("/") + "/v1/models"
+    for _ in range(40 if command else 1):
+        try:
+            r = requests.get(models_url, timeout=2)
             if r.ok:
                 ids = [m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()]
                 return f"llama.cpp OK — {len(ids)} model(s): {', '.join(ids)}"
         except Exception:
             pass
-        time.sleep(0.5)
-    return "llama.cpp router restart timed out"
+        if command:
+            time.sleep(0.5)
+    return f"llama.cpp did not respond at {url}"
 
 
 def check_ollama(url: str, backend: str = "ollama") -> str:
@@ -2833,11 +2831,14 @@ def build_ui():
         generate.click(lambda _unused: sync_compare_choices(history_choices(load_history())), inputs=prompt, outputs=[compare_a, compare_b])
         refresh_models.click(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel], outputs=[vision_model, writer_model, motion_model, ollama_status])
         check.click(check_ollama, inputs=[ollama_url, backend_sel], outputs=ollama_status)
-        rescan_btn.click(rescan_llamacpp_models, outputs=[ollama_status]).then(
-            refresh_ollama_models,
+        def rescan_and_refresh(url, vision, writer, motion, backend):
+            if backend != "llamacpp":
+                return gr.update(), gr.update(), gr.update(), "Rescan only applies to the llama.cpp backend."
+            status = rescan_llamacpp_models(url)
+            return (*refresh_ollama_models(url, vision, writer, motion, backend)[:3], status)
+        rescan_btn.click(rescan_and_refresh,
             inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel],
-            outputs=[vision_model, writer_model, motion_model, ollama_status]
-        )
+            outputs=[vision_model, writer_model, motion_model, ollama_status])
         app.load(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel], outputs=[vision_model, writer_model, motion_model, ollama_status])
         save_p.click(lambda x: save_text("prompt", x), inputs=prompt, outputs=saved)
         save_a.click(lambda x: save_text("analysis", x), inputs=analysis, outputs=saved)
@@ -3064,10 +3065,11 @@ def build_ui():
                     gr.Dropdown(choices=[], value=None),
                     "")
 
+        # Refresh only after the URL has switched, or the new backend is queried at the old URL.
         backend_sel.change(on_backend_change, inputs=backend_sel,
-                           outputs=[ollama_url, vision_model, writer_model, motion_model, ollama_status])
-        backend_sel.change(refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel],
-                           outputs=[vision_model, writer_model, motion_model, ollama_status])
+                           outputs=[ollama_url, vision_model, writer_model, motion_model, ollama_status]).then(
+            refresh_ollama_models, inputs=[ollama_url, vision_model, writer_model, motion_model, backend_sel],
+            outputs=[vision_model, writer_model, motion_model, ollama_status])
 
         # ---- Director Mode state persistence ----
         director_inputs_for_save = [
