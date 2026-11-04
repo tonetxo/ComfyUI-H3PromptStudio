@@ -43,6 +43,10 @@ In `do_generate`, if the writer model name matches `is_minimax_enhancer()` (`min
 
 Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags like `<Picture 1>`, `<Video 1>`, `<Audio 1>`, `<Voice 1>` must survive verbatim into the final prompt. In Director Mode the GUI's Motion model selector doubles as the Director/Planner model (see `DIRECTOR_MODE.md`).
 
+## Plano-secuencia tab (h3_gui.py)
+
+Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI's VideoConcat. `ONER_SYSTEM` is a copy of `onerSystem` in the SwarmUI H3PromptStudio extension (`Assets/h3_prompt_studio.js`), so keep the two in sync. There is no link to Swarm here: the user pastes the results. Saved files go to `outputs/plano_secuencia/`.
+
 ## State the GUI writes (don't hand-edit while it runs)
 
 - `config.json` — rewritten by `save_config()` on most actions. Its values (`keep_alive: "0m"`, llama.cpp backend, etc.) differ from `DEFAULT_CONFIG` in `h3_gui.py`.

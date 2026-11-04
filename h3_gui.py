@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import random
 import re
 import shutil
@@ -14,6 +15,7 @@ from typing import Any, Dict, Optional
 
 import gradio as gr
 import requests
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -1509,6 +1511,9 @@ def _persist_refs(state: Dict[str, Any]) -> Dict[str, Any]:
     d_refs = out.get("d_ref_state")
     if isinstance(d_refs, list):
         out["d_ref_state"] = [_copy_ref_to_persistent(p, "director") for p in d_refs]
+    o_refs = out.get("o_ref_state")
+    if isinstance(o_refs, list):
+        out["o_ref_state"] = [_copy_ref_to_persistent(p, "oner") for p in o_refs]
     return out
 
 
@@ -2028,7 +2033,7 @@ def load_director_package(name: Optional[str]):
         return failed(f"Could not load {name}: {exc}")
     save_director_ui_state({**persisted, **form, "d_ref_state": found, "d_ref_labels": ref_labels})
     form_outputs = tuple(form.get(f, gr.update()) for f in DIRECTOR_FORM_FIELDS)
-    return outputs + (found, found, ref_labels, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs
+    return outputs + (found, ref_gallery_items(found), ref_labels, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs
 
 
 def list_director_packages(limit: int = 20) -> str:
@@ -2085,6 +2090,35 @@ def save_director(result):
 def apply_preset(preset):
     p = PRESETS_DATA[preset]
     return p["style"], p["camera"], p["motion"], p["audio"], p["negative"]
+
+
+def image_size_text(path: Any) -> str:
+    """Return "1920×1080 · 16:9" for an image file, or "" if it cannot be read."""
+    try:
+        with Image.open(path) as img:
+            width, height = img.size
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+    divisor = math.gcd(width, height) or 1
+    w, h = width // divisor, height // divisor
+    # An exact ratio like 427:240 says nothing at a glance, so large terms become a decimal.
+    ratio = f"{w}:{h}" if max(w, h) <= 21 else f"{width / height:.2f}:1"
+    return f"{width}×{height} · {ratio}"
+
+
+def ref_gallery_items(paths: list[str], tagged: bool = False) -> list[tuple[str, str]]:
+    """Build gallery items captioned with each image's size, optionally under its <Picture N> tag."""
+    items = []
+    for i, path in enumerate(paths, 1):
+        if Path(path).exists():
+            size = image_size_text(path)
+            items.append((path, f"<Picture {i}>\n{size}" if tagged else size))
+    return items
+
+
+def image_label(base: str, path: Any) -> str:
+    size = image_size_text(path) if path else ""
+    return f"{base} · {size}" if size else base
 
 
 def extract_paths(value: Any) -> list[str]:
@@ -2294,6 +2328,196 @@ def director_prompt_text(result):
     return "\n".join(lines)
 
 
+# ---- Plano-secuencia: one continuous take in segments, for MiniMax H3 Ref + SwarmUI's VideoConcat ----
+# ONER_SYSTEM is a copy of onerSystem in the SwarmUI H3PromptStudio extension (Assets/h3_prompt_studio.js).
+ONER_MAX_REFS = 9  # SwarmUI reads at most 9 prompt images for MiniMax H3 references.
+ONER_MAX_FRAMES = 362
+ONER_REQUIRED_SECTIONS = ["subject_definitions:", "summary:", "retention_analysis:", "detailed_description:", "overall_soundscape:", "non_diegetic_music:"]
+ONER_SYSTEM = """You are a director writing prompts for MiniMax H3 (reference model). You receive a brief, a written analysis of numbered reference images, and a list of segment durations. Write one prompt per segment. The segments are generated separately and joined into ONE continuous single-take shot (plano-secuencia).
+
+HOW THE PIPELINE WORKS
+- Attached images are numbered in the order given: <Picture 1>, <Picture 2>, ...
+- Every segment receives all the images, so labels mean the same thing in every prompt.
+- Each segment after the first starts from the last frame of the previous one. Only that one frame carries over: no motion, memory or story.
+- Each prompt is read in isolation, so it must fully restate everything it needs.
+
+STEP 1: PLAN (do this silently, never output it)
+- Study each image's analysis and assign it a role: character, location, object or style.
+- Plan one continuous camera path and action through one continuous space and time.
+- Pace the action so that each segment fits its duration, with one main action per segment.
+- For each join, define a handoff state: subject position and pose, camera position and framing, lighting.
+
+SINGLE-TAKE RULES
+- Each segment contains exactly one section, [Shot 1]. Never write [Shot 2], timestamps, cuts, dissolves, fades, flashbacks or time jumps.
+- Reach new places only by physically moving the camera or the subject through space.
+- Segment 1 opens freely. Later segments open by describing the previous segment's handoff state, using the same wording.
+- End each segment on its handoff state, with camera and subject moving slowly or nearly at rest. Never end on a fast action, a jump, an impact or a whip pan.
+- Start the next segment by restating the direction and speed of any motion that continues.
+- Keep identity, clothing, props, time of day, light direction, color palette and visual style identical across segments, unless the brief asks for a change that happens on screen.
+- Keep every line of dialogue inside one segment, finishing at least one second before the segment ends.
+
+REFERENCE RULES
+- In each segment, define only the images used in that segment. Never mention the others.
+- Define a character, object or location that comes from an image as <Subject N>, citing its source: "<Subject 1> is the woman with short red hair and a green coat in <Picture 1>."
+- Keep the same <Subject N> number for the same thing in all segments.
+- Describe what the image shows; do not invent contradicting features.
+- Do not use any labels other than <Subject N> and <Picture N>.
+
+SECTIONS FOR EACH SEGMENT, IN THIS ORDER
+subject_definitions:
+One line per subject, with its main visible features and source picture.
+
+summary:
+One short paragraph starting with [reference generation].
+
+retention_analysis:
+One line per subject: <Subject N> (appears in [Shot 1]): marker - explanation
+Markers: fully_preserved | partially_preserved | attribute_transfer | weak_reference
+
+detailed_description:
+One or two style sentences, then [Shot 1] with composition, position, action, camera motion (type, amplitude, speed), lighting and synchronized sound, in chronological order. Give speakers stable IDs: <Subject 1> (S1). Write dialogue as <d>[Language] exact words</d>.
+
+overall_soundscape:
+One to three sentences on ambience and physical sounds. Keep the same ambience base in every segment.
+
+non_diegetic_music:
+Instrumentation, tempo and dynamics only. Use the same description in every segment and never end or swell at the end of a segment. Write N/A if there is no music.
+
+FORMAT
+- Write in English, except for dialogue in its original language.
+- Keep each segment under about 350 words.
+- Output only the segments, with no comments, reasoning or markdown, each one preceded by its own marker line:
+=== SEGMENT 1 ===
+=== SEGMENT 2 ===
+(and so on)"""
+_oner_vision_cache: Dict[Any, list] = {}
+
+
+def align_h3_frames(value: int) -> int:
+    """Round up to H3's 5 + 17n frame grid."""
+    return min(ONER_MAX_FRAMES, 5 + 17 * math.ceil(max(0, value - 5) / 17))
+
+
+def parse_oner_frames(text: str) -> list[int]:
+    try:
+        values = [int(x) for x in re.split(r"[\s,]+", text or "") if x]
+    except ValueError:
+        raise ValueError("Las duraciones deben ser frames enteros, por ejemplo: 243, 243, 243") from None
+    if any(v < 1 for v in values):
+        raise ValueError("Las duraciones deben ser frames enteros, por ejemplo: 243, 243, 243")
+    return values
+
+
+def parse_oner_segments(text: str) -> list[str]:
+    clean = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
+    starts = list(re.finditer(r"^[ \t]*=+[ \t]*SEGMENT[ \t]+\d+[ \t]*=+[ \t]*$", clean, flags=re.M | re.I))
+    segments = []
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(clean)
+        # ||| is VideoConcat's section separator, so it can never appear inside a prompt.
+        segment = clean[m.end():end].replace("|||", " ").strip()
+        if segment:
+            segments.append(segment)
+    return segments
+
+
+def oner_warnings(segments: list[str], expected: int, ref_count: int) -> list[str]:
+    out = []
+    if len(segments) != expected:
+        out.append(f"se esperaban {expected} segmentos y llegaron {len(segments)} (si la salida se cortó, sube max tokens)")
+    for i, s in enumerate(segments, 1):
+        missing = [r for r in ONER_REQUIRED_SECTIONS if r not in s]
+        if missing:
+            out.append(f"al segmento {i} le falta {', '.join(missing)}")
+        if re.search(r"\[Shot\s+(?!0*1\])\d+\]", s, flags=re.I):
+            out.append(f"el segmento {i} tiene más de un plano")
+        unknown = sorted({int(n) for n in re.findall(r"<Picture\s+(\d+)>", s, flags=re.I) if not 1 <= int(n) <= ref_count})
+        if unknown:
+            out.append(f"el segmento {i} cita imágenes que no existen ({', '.join(map(str, unknown))})")
+    return out
+
+
+def oner_generate(scene, frames_text, reference_files, reference_labels, style, audio, dialogue,
+                  backend, ollama_url, vision_model, writer_model, tv, tw, num_ctx, keep_alive):
+    cfg = load_config()
+    cfg.update({
+        "backend": backend,
+        "ollama_url": ollama_url.strip() or cfg["ollama_url"],
+        "vision_model": (vision_model or "").strip(),
+        "writer_model": (writer_model or "").strip(),
+        "temperature_vision": float(tv),
+        "temperature_writer": float(tw),
+        "num_ctx": int(num_ctx),
+        "keep_alive": keep_alive,
+    })
+    save_config(cfg)
+    if not (scene or "").strip():
+        raise ValueError("Describe la secuencia primero.")
+    requested = parse_oner_frames(frames_text)
+    if len(requested) < 2:
+        raise ValueError("Plano-secuencia necesita al menos 2 duraciones. Para un solo segmento, usa la pestaña principal.")
+    paths = extract_paths(reference_files)
+    if not paths:
+        raise ValueError("Añade al menos una imagen de referencia.")
+    if len(paths) > ONER_MAX_REFS:
+        raise ValueError(f"MiniMax H3 admite como máximo {ONER_MAX_REFS} imágenes de referencia aquí.")
+    if not cfg["writer_model"]:
+        raise ValueError("Selecciona un Writer model.")
+    if is_minimax_enhancer(cfg["writer_model"]):
+        raise ValueError("El enhancer de MiniMax escribe un prompt cada vez. Selecciona un modelo general como Writer.")
+    # Analyses are kept per image set, so rewriting the prompts does not re-run vision.
+    cache_key = (tuple(paths), reference_labels or "", cfg["vision_model"])
+    library = _oner_vision_cache.get(cache_key)
+    if library is None:
+        library = analyze_reference_library(cfg, paths, reference_labels, tv)
+        _oner_vision_cache[cache_key] = library
+    frames = [align_h3_frames(v) for v in requested]
+    segment_lines = "\n".join(f"Segment {i}: {f} frames ({f / 24:.2f} s)" for i, f in enumerate(frames, 1))
+    pictures = "\n\n".join(f"{r['tag']} ({r['role']}, {r['label']}):\n{json.dumps(r['analysis'], ensure_ascii=False, indent=2)}" for r in library)
+    user_prompt = (f"Write exactly {len(frames)} segments.\n\nBRIEF:\n{scene.strip()}\n\nSEGMENTS:\n{segment_lines}\n\n"
+                   f"REFERENCE IMAGES:\n{pictures}\n\nSTYLE:\n{style or 'Decide from the brief and images.'}\n\n"
+                   f"AUDIO:\n{audio or 'Decide from the brief.'}\n\nDIALOGUE:\n{dialogue or 'None.'}")
+    max_tokens = max(int(cfg.get("max_tokens") or 4096), len(frames) * 1200)
+    raw = ollama_chat(cfg, cfg["writer_model"], [{"role": "system", "content": ONER_SYSTEM}, {"role": "user", "content": user_prompt}], tw, max_tokens=max_tokens)
+    if keep_alive == "0m":
+        ollama_unload_all(cfg["ollama_url"])
+    segments = parse_oner_segments(raw)
+    if not segments:
+        raise ValueError(f"La salida del modelo no tiene marcadores de segmento: {raw.strip()[:200]}")
+    warnings = oner_warnings(segments, len(frames), len(paths))
+    status = f"⚠️ {'; '.join(warnings)}" if warnings else f"OK: {len(segments)} segmentos, {','.join(map(str, frames))} frames"
+    return segments[0], "\n|||\n".join(segments[1:]), ",".join(map(str, frames)), status
+
+
+def save_oner(main, sections, frames):
+    if not (main or "").strip():
+        return "Genera los prompts primero."
+    out = ROOT / "outputs" / "plano_secuencia"
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"plano_secuencia_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    path.write_text(f"=== MAIN PROMPT ===\n{main.strip()}\n\n=== SECTION PROMPTS ===\n{(sections or '').strip()}\n\n=== SECTION DURATIONS ===\n{(frames or '').strip()}\n", encoding="utf-8")
+    return str(path)
+
+
+# Reference thumbnails show the whole image: margin around it, and extra room below for the caption badge.
+REF_GALLERY_HEIGHT = 380
+REF_GALLERY_CSS = """
+.ref-image .image-frame { padding-top: 36px; box-sizing: border-box; }
+.ref-image .image-frame img { max-height: 70vh; }
+.ref-gallery .thumbnail-small img { object-fit: contain !important; }
+.ref-gallery .grid-wrap { padding-top: 40px !important; }
+.ref-gallery .thumbnail-lg > img { padding: 6px; box-sizing: border-box; }
+.ref-gallery .thumbnail-lg:has(.caption-label) > img { padding-bottom: 30px; }
+.ref-gallery-tagged .thumbnail-lg:has(.caption-label) > img { padding-bottom: 48px; }
+.ref-gallery .caption-label { max-width: 100%; white-space: pre-line; }
+"""
+
+
+SINGLE_IMAGE_LABEL = "Reference Image (<Picture 1>)"
+FLF_FIRST_LABEL = "First Frame (<Picture 1> - Start / Initial State)"
+FLF_LAST_LABEL = "Last Frame (<Picture 2> - End / Target State)"
+
+
 def build_ui():
     cfg = load_config()
     hist = load_history()
@@ -2321,16 +2545,16 @@ def build_ui():
                 # --- Adaptive Visual References Container ---
                 # 1. Single Reference (I2VA, L2VA, T2VA)
                 with gr.Row(visible=single_visible) as single_img_row:
-                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label="Reference Image (<Picture 1>)", sources=["upload", "clipboard"])
+                    single_image = gr.Image(value=ui_state.get("single_image"), type="filepath", label=image_label(SINGLE_IMAGE_LABEL, ui_state.get("single_image")), elem_classes="ref-image", sources=["upload", "clipboard"])
 
                 # 2. Dual Reference (FLF2VA / LTX Video FLF)
                 with gr.Row(visible=flf_visible) as flf_img_row:
-                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label="First Frame (<Picture 1> - Start / Initial State)", sources=["upload", "clipboard"])
-                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label="Last Frame (<Picture 2> - End / Target State)", sources=["upload", "clipboard"])
+                    flf_first = gr.Image(value=ui_state.get("flf_first"), type="filepath", label=image_label(FLF_FIRST_LABEL, ui_state.get("flf_first")), elem_classes="ref-image", sources=["upload", "clipboard"])
+                    flf_last = gr.Image(value=ui_state.get("flf_last"), type="filepath", label=image_label(FLF_LAST_LABEL, ui_state.get("flf_last")), elem_classes="ref-image", sources=["upload", "clipboard"])
 
                 # 3. Multi Reference (R2V - up to 6 images)
                 saved_r2v_paths = ui_state.get("r2v_state", [])
-                saved_r2v_items = [(p, f"<Picture {i}>: {Path(p).name}") for i, p in enumerate(saved_r2v_paths, 1) if Path(p).exists()]
+                saved_r2v_items = ref_gallery_items(saved_r2v_paths, tagged=True)
                 r2v_info_md = (
                     f"**{len(saved_r2v_items)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(saved_r2v_items) + 1)])
                     if saved_r2v_items
@@ -2350,8 +2574,9 @@ def build_ui():
                         label="R2V References (<Picture 1> ... <Picture 6>)",
                         show_label=True,
                         columns=3,
-                        height=200,
-                        object_fit="cover",
+                        height=REF_GALLERY_HEIGHT,
+                        object_fit="contain",
+                        elem_classes=["ref-gallery", "ref-gallery-tagged"],
                         type="filepath",
                         interactive=True,
                     )
@@ -2475,7 +2700,7 @@ def build_ui():
                     d_ref_state = gr.State(saved_d_items)
                     d_selected_ref_idx = gr.State(None)
                     d_file = gr.File(label="Upload / drop reference images (drop one at a time or many — they accumulate below)", file_count="multiple", file_types=["image"], type="filepath")
-                    d_refs = gr.Gallery(label="Reference images library (click an image to select and delete)", show_label=True, columns=4, height=200, object_fit="cover", type="filepath", interactive=True, value=saved_d_items)
+                    d_refs = gr.Gallery(label="Reference images library (click an image to select and delete)", show_label=True, columns=4, height=REF_GALLERY_HEIGHT, object_fit="contain", elem_classes="ref-gallery", type="filepath", interactive=True, value=ref_gallery_items(saved_d_items))
                     with gr.Row():
                         d_remove_selected = gr.Button("🗑️ Eliminar seleccionada", size="sm", interactive=False)
                         d_clear_refs = gr.Button("🧹 Borrar todas las referencias", size="sm", variant="secondary")
@@ -2514,6 +2739,33 @@ def build_ui():
             d_selected_meta = gr.Code(label="Selected shot metadata", language="json", lines=8, value=json.dumps(saved_d_meta, indent=2, ensure_ascii=False) if saved_d_meta else "")
             director_state = gr.State(ui_state.get("director_state", {}))
 
+        with gr.Tab("Plano-secuencia"):
+            gr.Markdown("## Plano-secuencia\nOne continuous take in segments, for MiniMax H3 Ref + SwarmUI's VideoConcat. Uses the Vision and Writer models selected in the main tab.")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    o_scene = gr.Textbox(label="Sequence brief", lines=6, value=ui_state.get("o_scene", ""), placeholder="Describe the whole take, and what each picture is.")
+                    o_frames = gr.Textbox(label="Segment durations (frames, valid: 5 + 17n, max 362)", value=ui_state.get("o_frames", "243, 243, 243"))
+                    saved_o_items = [p for p in ui_state.get("o_ref_state", []) if Path(p).exists()]
+                    o_ref_state = gr.State(saved_o_items)
+                    o_selected_ref_idx = gr.State(None)
+                    o_file = gr.File(label="Upload reference images (the order sets the <Picture N> numbers)", file_count="multiple", file_types=["image"], type="filepath")
+                    o_refs = gr.Gallery(label="Reference images (click an image to select and delete)", columns=4, height=REF_GALLERY_HEIGHT, object_fit="contain", elem_classes="ref-gallery", type="filepath", interactive=True, value=ref_gallery_items(saved_o_items))
+                    with gr.Row():
+                        o_remove_selected = gr.Button("🗑️ Eliminar seleccionada", size="sm", interactive=False)
+                        o_clear_refs = gr.Button("🧹 Borrar todas las referencias", size="sm", variant="secondary")
+                    o_ref_labels = gr.Textbox(label="Reference roles / labels (optional)", lines=3, value=ui_state.get("o_ref_labels", ""))
+                    o_style = gr.Textbox(label="Style", lines=2, value=ui_state.get("o_style", ""))
+                    o_audio = gr.Textbox(label="Audio", lines=2, value=ui_state.get("o_audio", ""))
+                    o_dialogue = gr.Textbox(label="Dialogue", lines=2, value=ui_state.get("o_dialogue", ""))
+                    o_generate = gr.Button("Generate prompts", variant="primary", size="lg")
+                    o_save = gr.Button("Save prompts (txt)")
+                    o_saved = gr.Textbox(label="Saved file", interactive=False)
+                with gr.Column(scale=1):
+                    o_status = gr.Textbox(label="Status", interactive=False, value=ui_state.get("o_status", ""))
+                    o_main = gr.Textbox(label="Main prompt (segment 1): paste into Swarm's prompt", lines=14, buttons=["copy"], value=ui_state.get("o_main", ""))
+                    o_sections = gr.Textbox(label="Section Prompts (segments 2+)", lines=16, buttons=["copy"], value=ui_state.get("o_sections", ""))
+                    o_final_frames = gr.Textbox(label="Final frames: first value to Text2Video Frames, all of them to Section Durations", interactive=False, buttons=["copy"], value=ui_state.get("o_final_frames", ""))
+
         def on_mode_change(m):
             if m == "FLF2VA":
                 return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
@@ -2538,7 +2790,7 @@ def build_ui():
                 if p and p not in updated and len(updated) < 6:
                     updated.append(p)
             updated = updated[:6]
-            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            gallery_items = ref_gallery_items(updated, tagged=True)
             info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
@@ -2554,7 +2806,7 @@ def build_ui():
             updated = list(current_list or [])
             if selected_idx is not None and isinstance(selected_idx, (int, float)) and 0 <= int(selected_idx) < len(updated):
                 updated.pop(int(selected_idx))
-            gallery_items = [(path, f"<Picture {i}>: {Path(path).name}") for i, path in enumerate(updated, 1)]
+            gallery_items = ref_gallery_items(updated, tagged=True)
             info_md = f"**{len(updated)}/6 referencias cargadas:** " + ", ".join([f"`<Picture {i}>`" for i in range(1, len(updated) + 1)]) if updated else "*(Sube hasta 6 imágenes para R2V. Cada imagen se etiquetará automáticamente como `<Picture 1>` a `<Picture 6>`)*"
             return updated, gallery_items, None, info_md, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
@@ -2667,7 +2919,7 @@ def build_ui():
                 if p and p not in updated:
                     updated.append(p)
             labels_text = generate_ref_labels_text(updated, current_labels)
-            return updated, updated, None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+            return updated, ref_gallery_items(updated), None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def on_ref_selected(current_list, evt: gr.SelectData):
             idx = evt.index
@@ -2681,7 +2933,7 @@ def build_ui():
             if selected_idx is not None and isinstance(selected_idx, (int, float)) and 0 <= int(selected_idx) < len(updated):
                 updated.pop(int(selected_idx))
             labels_text = generate_ref_labels_text(updated, current_labels)
-            return updated, updated, None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+            return updated, ref_gallery_items(updated), None, labels_text, None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
 
         def clear_all_refs():
             return [], [], None, "", None, gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
@@ -2755,6 +3007,12 @@ def build_ui():
         single_image.change(_save_main_from_inputs, inputs=main_inputs_for_save)
         flf_first.change(_save_main_from_inputs, inputs=main_inputs_for_save)
         flf_last.change(_save_main_from_inputs, inputs=main_inputs_for_save)
+
+        def _image_label_updater(base):
+            return lambda path: gr.update(label=image_label(base, path))
+
+        for image_comp, base_label in ((single_image, SINGLE_IMAGE_LABEL), (flf_first, FLF_FIRST_LABEL), (flf_last, FLF_LAST_LABEL)):
+            image_comp.change(_image_label_updater(base_label), inputs=image_comp, outputs=image_comp, show_progress="hidden")
 
         # Persist whenever R2V references are added or removed.
         def append_r2v_refs_and_save(single_img, ff, fl, old_r2v_state, new_files, current_list, *rest):
@@ -2830,7 +3088,7 @@ def build_ui():
         # Persist director reference images when uploaded or removed.
         # Each handler receives d_scene plus director_inputs_for_save[3:] and rebuilds the full
         # (d_scene, d_ref_state, d_ref_labels, *rest) tuple expected by _make_director_state_dict.
-        d_refs_outputs = [d_refs, d_ref_state, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected]
+        d_refs_outputs = [d_ref_state, d_refs, d_file, d_ref_labels, d_selected_ref_idx, d_remove_selected]
 
         def append_d_refs_and_save(new_files, current_list, current_labels, scene, *rest):
             updated, gallery, _, labels, _, btn = append_d_refs(new_files, current_list, current_labels)
@@ -2859,6 +3117,30 @@ def build_ui():
             except Exception:
                 pass
 
+        # ---- Plano-secuencia ----
+        oner_inputs_for_save = [o_scene, o_frames, o_ref_state, o_ref_labels, o_style, o_audio, o_dialogue]
+        def _save_oner_from_inputs(scene, frames, refs, labels, style, audio, dialogue):
+            save_director_ui_state({"o_scene": scene, "o_frames": frames, "o_ref_state": refs, "o_ref_labels": labels,
+                                    "o_style": style, "o_audio": audio, "o_dialogue": dialogue})
+        o_refs_outputs = [o_ref_state, o_refs, o_file, o_ref_labels, o_selected_ref_idx, o_remove_selected]
+        o_file.upload(append_d_refs, inputs=[o_file, o_ref_state, o_ref_labels], outputs=o_refs_outputs).then(_save_oner_from_inputs, inputs=oner_inputs_for_save)
+        o_refs.upload(append_d_refs, inputs=[o_refs, o_ref_state, o_ref_labels], outputs=o_refs_outputs).then(_save_oner_from_inputs, inputs=oner_inputs_for_save)
+        o_refs.select(on_ref_selected, inputs=[o_ref_state], outputs=[o_selected_ref_idx, o_remove_selected])
+        o_remove_selected.click(remove_selected_ref, inputs=[o_selected_ref_idx, o_ref_state, o_ref_labels], outputs=o_refs_outputs).then(_save_oner_from_inputs, inputs=oner_inputs_for_save)
+        o_clear_refs.click(clear_all_refs, outputs=o_refs_outputs).then(_save_oner_from_inputs, inputs=oner_inputs_for_save)
+        for comp in (o_scene, o_frames, o_ref_labels, o_style, o_audio, o_dialogue):
+            comp.change(_save_oner_from_inputs, inputs=oner_inputs_for_save)
+
+        def run_oner(*args):
+            main, sections, final_frames, status = oner_generate(*args)
+            save_director_ui_state({"o_main": main, "o_sections": sections, "o_final_frames": final_frames, "o_status": status})
+            return main, sections, final_frames, status
+        o_generate.click(run_oner,
+            inputs=[o_scene, o_frames, o_ref_state, o_ref_labels, o_style, o_audio, o_dialogue,
+                    backend_sel, ollama_url, vision_model, writer_model, temperature_vision, temperature_writer, num_ctx, keep_alive],
+            outputs=[o_main, o_sections, o_final_frames, o_status])
+        o_save.click(save_oner, inputs=[o_main, o_sections, o_final_frames], outputs=o_saved)
+
     return app
 
 
@@ -2885,7 +3167,7 @@ def main():
     app = build_ui()
     port = find_free_port(args.host, args.port) if args.auto_port else args.port
     print(f"MiniMax H3 Prompt Studio · http://{args.host}:{port}")
-    app.launch(server_name=args.host, server_port=port, share=args.share, inbrowser=True)
+    app.launch(server_name=args.host, server_port=port, share=args.share, inbrowser=True, css=REF_GALLERY_CSS)
 
 
 if __name__ == "__main__":
