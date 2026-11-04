@@ -56,7 +56,7 @@ Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI
 
 ## Git quirks
 
-`.gitignore` lists `h3_gui.py`, `custom_nodes/`, `AGENTS.md`, `*.json`, etc. as "local only", but `h3_gui.py` and `custom_nodes/ComfyUI-H3PromptStudio/*` are already tracked, so edits to them still show up in `git status`. New files under ignored paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
+The web GUI (`h3_gui.py`, `launch_gui.sh`, `README_GUI.md`, `DIRECTOR_MODE.md`) and `custom_nodes/ComfyUI-H3PromptStudio/` are published. `.gitignore` keeps local only: `AGENTS.md`, `REVISION.md`, GUI state (`config.json`, `prompt_history.json`, `outputs/`), `custom_nodes/ComfyUI-Qwen-Prompt-Rewriter/`, the custom node's `README.md`, `workflows/` and `*.json`. New files under those paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
 
 ## Constraints
 

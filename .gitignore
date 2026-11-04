@@ -11,16 +11,14 @@ venv/
 .vscode/
 *.DS_Store
 
-# Local Gradio GUI & development files (not in remote repo)
-h3_gui.py
-launch_gui.sh
-README_GUI.md
-DIRECTOR_MODE.md
+# Local development files and GUI state (not in remote repo)
 AGENTS.md
+REVISION.md
 config.json
 prompt_history.json
-custom_nodes/
 outputs/
+custom_nodes/ComfyUI-Qwen-Prompt-Rewriter/
+custom_nodes/ComfyUI-H3PromptStudio/README.md
 
 # Workflows & API JSONs (local only)
 workflows/
