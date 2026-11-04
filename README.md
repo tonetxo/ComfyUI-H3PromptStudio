@@ -48,6 +48,22 @@ It implements a 3-tier multimodal chain (**Forensic Vision Analysis $\rightarrow
 
 ---
 
+## 🖥️ Web GUI (standalone)
+
+The repo also includes **`h3_gui.py`**, a standalone Gradio app that runs without ComfyUI. It works with Ollama or llama.cpp and adds Director Mode, a Plano-secuencia tab (one continuous take in segments), prompt history and persistent form state.
+
+```bash
+git clone https://github.com/tonetxo/ComfyUI-H3PromptStudio.git
+cd ComfyUI-H3PromptStudio
+./launch_gui.sh
+```
+
+The script creates a `.venv`, installs `requirements-gui.txt` and opens the app, by default at `http://127.0.0.1:7860` (or the next free port). See [README_GUI.md](README_GUI.md) and [DIRECTOR_MODE.md](DIRECTOR_MODE.md).
+
+With llama.cpp, models come from your server's `/v1/models`. Scanning a `.gguf` folder and running a command from the "Rescan" button are optional: see [Optional local settings](README_GUI.md#ajustes-locales-opcionales).
+
+---
+
 ## 📦 Installation
 
 ### Method 1: Git Clone (Recommended)
