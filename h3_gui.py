@@ -2487,14 +2487,122 @@ def oner_generate(scene, frames_text, reference_files, reference_labels, style, 
     return segments[0], "\n|||\n".join(segments[1:]), ",".join(map(str, frames)), status
 
 
-def save_oner(main, sections, frames):
+ONER_DIR = ROOT / "outputs" / "plano_secuencia"
+ONER_FORM_FIELDS = ["o_scene", "o_frames", "o_ref_labels", "o_style", "o_audio", "o_dialogue"]
+
+
+def save_oner(main, sections, frames, scene="", frames_text="", refs=None, labels="", style="", audio="", dialogue=""):
+    """Save the prompts as a pasteable .txt, plus a .json sidecar and the reference images so the tab can be restored."""
     if not (main or "").strip():
         return "Genera los prompts primero."
-    out = ROOT / "outputs" / "plano_secuencia"
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / f"plano_secuencia_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    ONER_DIR.mkdir(parents=True, exist_ok=True)
+    path = ONER_DIR / f"plano_secuencia_{time.strftime('%Y%m%d_%H%M%S')}.txt"
     path.write_text(f"=== MAIN PROMPT ===\n{main.strip()}\n\n=== SECTION PROMPTS ===\n{(sections or '').strip()}\n\n=== SECTION DURATIONS ===\n{(frames or '').strip()}\n", encoding="utf-8")
-    return str(path)
+    refs_dir = path.with_name(f"{path.stem}_refs")
+    ref_names, not_copied = [], []
+    for p in extract_paths(refs):
+        src = Path(p)
+        try:
+            refs_dir.mkdir(exist_ok=True)
+            shutil.copy2(src, refs_dir / src.name)
+            ref_names.append(src.name)
+        except OSError:
+            not_copied.append(src.name)
+    form = dict(zip(ONER_FORM_FIELDS, [scene, frames_text, labels, style, audio, dialogue]))
+    sidecar = {"form": {k: v or "" for k, v in form.items()}, "references": ref_names,
+               "main": main, "sections": sections or "", "final_frames": frames or ""}
+    path.with_suffix(".json").write_text(json.dumps(sidecar, indent=2, ensure_ascii=False), encoding="utf-8")
+    warning = f"\nReferencias NO copiadas: {', '.join(not_copied)}" if not_copied else ""
+    return f"{path}{warning}"
+
+
+def _oner_saved_files() -> list[Path]:
+    """Saved plano-secuencia .txt files, newest first."""
+    return sorted(ONER_DIR.glob("plano_secuencia_*.txt"), key=lambda p: p.name, reverse=True)
+
+
+def _oner_sidecar(path: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def oner_saved_choices() -> list[tuple[str, str]]:
+    """(label, file name) pairs for the plano-secuencia selector."""
+    choices = []
+    for path in _oner_saved_files():
+        data = _oner_sidecar(path)
+        brief = " ".join(str((data.get("form") or {}).get("o_scene") or "").split())
+        label = f"{path.stem} — {brief[:60] + ('…' if len(brief) > 60 else '')}" if brief else f"{path.stem} (solo prompts)"
+        choices.append((label, path.name))
+    return choices
+
+
+def refresh_oner_selector():
+    return gr.update(choices=oner_saved_choices())
+
+
+def parse_oner_txt(text: str) -> tuple[str, str, str]:
+    """Split a saved .txt back into (main prompt, section prompts, final frames)."""
+    parts = re.split(r"^=== (MAIN PROMPT|SECTION PROMPTS|SECTION DURATIONS) ===[ \t]*$", text or "", flags=re.M)
+    found = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+    return found.get("MAIN PROMPT", ""), found.get("SECTION PROMPTS", ""), found.get("SECTION DURATIONS", "")
+
+
+def load_oner(name: Optional[str]):
+    """Restore a saved plano-secuencia into the tab: prompts, and the form and references when a sidecar exists.
+
+    Outputs: o_main, o_sections, o_final_frames, o_status, o_ref_state, o_refs, o_selected_ref_idx,
+    o_remove_selected, then ONER_FORM_FIELDS. On failure only the status changes.
+    """
+    def failed(message: str) -> tuple:
+        return (gr.update(),) * 3 + (message,) + (gr.update(),) * (4 + len(ONER_FORM_FIELDS))
+
+    if not name:
+        return failed("Selecciona un plano-secuencia guardado.")
+    # Match against what is on disk so the name can never address a path outside plano_secuencia.
+    path = next((p for p in _oner_saved_files() if p.name == name), None)
+    if path is None:
+        return failed(f"No encontrado: {name}")
+    try:
+        main, sections, final_frames = parse_oner_txt(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return failed(f"No se pudo cargar {name}: {exc}")
+    if not main:
+        return failed(f"{name} no tiene MAIN PROMPT.")
+    data = _oner_sidecar(path)
+    status = f"Cargado {path.stem}"
+    if not data:
+        status += " · sin datos del formulario (guardado antiguo): se mantienen los valores y referencias actuales"
+        persisted = {"o_main": main, "o_sections": sections, "o_final_frames": final_frames, "o_status": status}
+        save_director_ui_state(persisted)
+        return (main, sections, final_frames, status) + (gr.update(),) * (4 + len(ONER_FORM_FIELDS))
+    form_raw = data.get("form") if isinstance(data.get("form"), dict) else {}
+    form = {f: form_raw[f] for f in ONER_FORM_FIELDS if isinstance(form_raw.get(f), str)}
+    refs, missing = [], []
+    refs_dir = path.with_name(f"{path.stem}_refs")
+    for ref_name in data.get("references") or []:
+        ref_name = Path(str(ref_name)).name  # never follow a path stored in the JSON
+        src = refs_dir / ref_name
+        dest = UI_REFS_DIR / "oner" / ref_name
+        try:
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+            refs.append(str(dest))
+        except OSError:
+            missing.append(ref_name)
+    if refs:
+        status += f" · {len(refs)} imágenes de referencia"
+    if missing:
+        status += f" · FALTAN (la numeración <Picture N> puede cambiar): {', '.join(missing)}"
+    save_director_ui_state({"o_main": main, "o_sections": sections, "o_final_frames": final_frames, "o_status": status,
+                            "o_ref_state": refs, **form})
+    form_outputs = tuple(form.get(f, gr.update()) for f in ONER_FORM_FIELDS)
+    return ((main, sections, final_frames, status, refs, ref_gallery_items(refs), None,
+             gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs)
 
 
 # Reference thumbnails show the whole image: margin around it, and extra room below for the caption badge.
@@ -2758,6 +2866,8 @@ def build_ui():
                     o_generate = gr.Button("Generate prompts", variant="primary", size="lg")
                     o_save = gr.Button("Save prompts (txt)")
                     o_saved = gr.Textbox(label="Saved file", interactive=False)
+                    o_saved_selector = gr.Dropdown(choices=oner_saved_choices(), value=None, label="Saved plano-secuencia prompts", allow_custom_value=False)
+                    o_load = gr.Button("Load saved prompts (replaces the current ones)")
                 with gr.Column(scale=1):
                     o_status = gr.Textbox(label="Status", interactive=False, value=ui_state.get("o_status", ""))
                     o_main = gr.Textbox(label="Main prompt (segment 1): paste into Swarm's prompt", lines=14, buttons=["copy"], value=ui_state.get("o_main", ""))
@@ -3141,7 +3251,12 @@ def build_ui():
             inputs=[o_scene, o_frames, o_ref_state, o_ref_labels, o_style, o_audio, o_dialogue,
                     backend_sel, ollama_url, vision_model, writer_model, temperature_vision, temperature_writer, num_ctx, keep_alive],
             outputs=[o_main, o_sections, o_final_frames, o_status])
-        o_save.click(save_oner, inputs=[o_main, o_sections, o_final_frames], outputs=o_saved)
+        o_save.click(save_oner, inputs=[o_main, o_sections, o_final_frames, o_scene, o_frames, o_ref_state, o_ref_labels, o_style, o_audio, o_dialogue],
+                     outputs=o_saved).then(refresh_oner_selector, outputs=o_saved_selector)
+        o_load.click(load_oner, inputs=o_saved_selector,
+                     outputs=[o_main, o_sections, o_final_frames, o_status, o_ref_state, o_refs, o_selected_ref_idx, o_remove_selected,
+                              o_scene, o_frames, o_ref_labels, o_style, o_audio, o_dialogue])
+        app.load(refresh_oner_selector, outputs=o_saved_selector)
 
     return app
 
