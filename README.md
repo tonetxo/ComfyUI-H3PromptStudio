@@ -116,13 +116,21 @@ ollama pull mistral:latest
 | `duration` | COMBO | `5s`, `6s`, `8s`, `10s`, `12s`, `15s`, `18s`, `20s`, `25s`, `30s`. |
 | `aspect_ratio` | COMBO | `16:9`, `9:16`, `1:1`, `4:3`, `3:4`, `21:9`, `2.39:1`. |
 | `enable_motion_director`| BOOLEAN | Enable intermediate physics and secondary motion planning. |
-| `vision_model` | COMBO | Dropdown populated with local Ollama vision models. |
-| `motion_model` | COMBO | Dropdown populated with local Ollama text models. |
-| `writer_model` | COMBO | Dropdown populated with local Ollama text models. |
-| `first_frame_image` | IMAGE (Optional) | Starting reference image. |
-| `last_frame_image` | IMAGE (Optional) | Ending reference image for First-Last Frame (FLF) interpolation. |
-| `unload_models_after_gen` | BOOLEAN (Default: True) | Eagerly unloads vision model and purges all Ollama models from VRAM after generation to prevent CUDA OOM. |
-| `custom_*_override` | STRING (Optional) | Direct model name string or style/camera/audio overrides. |
+| `vision_model` | COMBO | Ollama vision model (shown when `backend = ollama`). |
+| `motion_model` | COMBO | Ollama text model for the Motion Director (shown when `backend = ollama`). |
+| `writer_model` | COMBO | Ollama text model for the prompt writer (shown when `backend = ollama`). |
+| `vision_model_llamacpp` / `motion_model_llamacpp` / `writer_model_llamacpp` | COMBO | Same three roles for the llama.cpp server (shown when `backend = llamacpp`). |
+| `temp_vision` / `temp_motion` / `temp_writer` | FLOAT | Sampling temperature for each stage (defaults 0.15 / 0.25 / 0.35). |
+| `num_ctx` | INT | Context window passed to the LLM backend (default 32768). |
+| `unload_models_after_gen` | BOOLEAN (Optional, Default: True) | Unloads the stage models after generation to free VRAM. |
+| `first_frame_image` | IMAGE (Optional) | Starting reference image. Maps to the functional anchor `<Picture 1>`. |
+| `last_frame_image` | IMAGE (Optional) | Ending reference image. Connecting it switches `I2VA` to `FLF2VA` automatically. |
+| `backend` | COMBO (Optional) | `ollama` or `llamacpp`. Switches the visible model widgets and the URL. |
+| `ollama_url` | STRING (Optional) | Backend URL; set automatically from `backend`. |
+| `custom_vision_override` / `custom_motion_override` / `custom_writer_override` | STRING (Optional) | Model name typed by hand; when non-empty it replaces the model selected in the dropdown for that stage. |
+| `custom_style` / `custom_camera` / `custom_motion` / `custom_audio` / `custom_negative` | STRING (Optional, Multiline) | Filled with the preset's text, and updated when the preset changes as long as you have not edited them. Edited text is kept as an override; an empty field also falls back to the preset. |
+| `custom_dialogue` / `custom_constraints` | STRING (Optional, Multiline) | Dialogue and continuity instructions. Filled with the default text when empty; an empty field also falls back to that default. |
+| `custom_video` | STRING (Optional) | Note describing how the `<Video 1>` reference should drive the motion; enables the video-reference requirement. |
 
 **Outputs:**
 * `positive_prompt` (STRING): Final production-ready prompt.

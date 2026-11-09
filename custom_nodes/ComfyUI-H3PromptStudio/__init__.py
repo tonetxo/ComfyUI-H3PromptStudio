@@ -10,9 +10,9 @@ except ImportError:
     web = None
 
 try:
-    from .nodes import DEFAULT_LLAMACPP_URL, NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, load_local_settings
+    from .nodes import DEFAULT_LLAMACPP_URL, NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, PRESETS_DATA, load_local_settings
 except (ImportError, ValueError):
-    from nodes import DEFAULT_LLAMACPP_URL, NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, load_local_settings
+    from nodes import DEFAULT_LLAMACPP_URL, NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS, PRESETS_DATA, load_local_settings
 
 WEB_DIRECTORY = "./web"
 
@@ -58,6 +58,11 @@ def register_routes():
         if web is not None:
             return web.json_response(_rescan_and_restart())
         return web.json_response({"ok": False, "message": "aiohttp unavailable"})
+
+    @PromptServer.instance.routes.get("/h3promptstudio/presets")
+    async def h3_presets(request):
+        # Preset texts, used by the web UI as placeholders for empty custom_* fields.
+        return web.json_response(PRESETS_DATA)
 
 
 register_routes()
