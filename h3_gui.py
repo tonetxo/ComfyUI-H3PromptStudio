@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
 }
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
-PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
+PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Interaction", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
 DIRECTOR_TOTALS = ["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"]
 DIRECTOR_SHOTS = ["5","6","8","10","12","15","18","20","25","30"]
 # Director form values stored with each sequence, so a loaded package can be rebuilt as it was made.
@@ -60,6 +60,13 @@ PRESETS_DATA = {
         "motion": "Small natural gestures, breathing, posture shifts, eye movement, cloth motion and reactive background activity. Keep dialogue physically synchronized with visible speakers.",
         "audio": "Clean diegetic dialogue with clearly separated speakers, natural room tone and subtle environmental sounds. No music unless requested.",
         "negative": "Mismatched speaker identity; lip-sync drift; random dialogue; frozen actors; frozen background; abrupt camera changes; duplicated people; unwanted music.",
+    },
+    "H3 Interaction": {
+        "style": "photorealistic intimate cinematic realism, natural skin texture, soft motivated lighting, grounded human performance and believable chemistry between people",
+        "camera": "stable coverage that keeps every participant readable: two-shot or medium shot, slow orbit, gentle push-in, or smooth tracking alongside people walking together; preserve eyelines and relative positions; no cuts unless requested",
+        "motion": "Make physical contact believable and continuous: hands rest, press and slide with visible weight, bodies lean into each other and share balance, steps stay synchronized when walking or dancing together. Show natural breathing, head tilts, eye contact, blinking, small smiles and reactions from every person, not only the active one. Clothing and hair respond to contact and movement. Each person keeps their own body, limbs and identity; contact points stay stable instead of sliding through bodies or clothing.",
+        "audio": "Intimate diegetic sound: footsteps in time with the steps, fabric rustle on contact, breathing, soft laughter, and the ambience of the location. Speech only if requested. Music only when the scene calls for it (e.g. dancing), as a diegetic source.",
+        "negative": "Merged or fused bodies; extra or missing limbs or fingers; hands passing through bodies or clothing; hands floating without contact; faces swapping or identity drift between people; mismatched lip sync; stiff mannequin posture; one partner frozen while the other moves; out-of-sync steps; sliding feet; teleporting positions; camera cuts; duplicated people; unwanted dialogue or music.",
     },
     "H3 Horror": {
         "style": "photorealistic cinematic horror, oppressive atmosphere, restrained practical lighting, tactile textures",
