@@ -32,8 +32,9 @@ The same pipeline exists in three separately maintained copies that have drifted
 `config.json` → `backend` selects `"ollama"` or `"llamacpp"`; the URL is always stored in `ollama_url` even for llama.cpp (currently `http://127.0.0.1:8080`).
 
 - **ollama**: models from `GET /api/tags`; calls via `/api/chat` / `/api/generate`; `keep_alive` and `num_ctx` apply; explicit unload helpers (`ollama_unload_model`, `ollama_unload_all`).
-- **llamacpp**: OpenAI-compatible router at `/v1/models` and `/v1/chat/completions` (`llamacpp_chat_completion`), with thinking disabled via `chat_template_kwargs`. `keep_alive` does not apply (server sleeps idle models). Model list = router models + a hardcoded fallback list + `.gguf` files scanned from `/home/tonetxo/gguf-models`. `_resolve_llamacpp_model` maps aliases.
-- "Rescan" runs `~/.config/h3ps/rescan_llamacpp_models.py` (regenerates `~/.config/h3ps/llamacpp-models.ini`) and then `systemctl --user restart h3ps-llamacpp.service`. These machine-specific paths are hardcoded in both `h3_gui.py` and the custom node's `__init__.py`.
+- **llamacpp**: OpenAI-compatible router at `/v1/models` and `/v1/chat/completions` (`llamacpp_chat_completion`), with thinking disabled via `chat_template_kwargs`. `keep_alive` does not apply (server sleeps idle models). Model list = router models + `.gguf` files from the optional `gguf_models_dir`. `_resolve_llamacpp_model` maps aliases.
+- "Rescan" re-queries the server, after running `llamacpp_rescan_command` if set.
+- Per-machine options live in the optional `~/.config/h3ps/settings.json` (`gguf_models_dir`, `llamacpp_rescan_command`, `llamacpp_url`, `llamacpp_extra_models`), read by `h3_gui.py` and the custom node pack; see `README_GUI.md`. Never hardcode machine paths or model names in the code.
 
 `ollama_chat()` is the single entry point used by the pipeline; it dispatches to llama.cpp when `backend == "llamacpp"`.
 
@@ -42,6 +43,10 @@ The same pipeline exists in three separately maintained copies that have drifted
 In `do_generate`, if the writer model name matches `is_minimax_enhancer()` (`minimax`+`enhancer` or `video-prompt-enhancer`), the writer step uses `generate_enhanced_prompt()` with per-mode structured system prompts (`ENHANCER_SYSTEM_*`: T2VA / I2VA / FL2VA / L2VA / REF for R2V). If `is_enhancer_output_valid()` rejects the result, it falls back to the generic `build_writer_prompt()` + `generate_prompt()` path. LLM JSON output goes through `extract_json` / `_try_parse_json` / `_repair_json`, which tolerate malformed model output.
 
 Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags like `<Picture 1>`, `<Video 1>`, `<Audio 1>`, `<Voice 1>` must survive verbatim into the final prompt. In Director Mode the GUI's Motion model selector doubles as the Director/Planner model (see `DIRECTOR_MODE.md`).
+
+## Plano-secuencia tab (h3_gui.py)
+
+Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI's VideoConcat. `ONER_SYSTEM` is a copy of `onerSystem` in the SwarmUI H3PromptStudio extension (`Assets/h3_prompt_studio.js`), so keep the two in sync. There is no link to Swarm here: the user pastes the results. Saved files go to `outputs/plano_secuencia/`: the pasteable `.txt`, a `.json` sidecar with the form, and `<stem>_refs/` with the images; "Load saved prompts" restores them (older saves without a sidecar restore only the prompts).
 
 ## State the GUI writes (don't hand-edit while it runs)
 
@@ -52,7 +57,7 @@ Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags 
 
 ## Git quirks
 
-`.gitignore` lists `h3_gui.py`, `custom_nodes/`, `AGENTS.md`, `*.json`, etc. as "local only", but `h3_gui.py` and `custom_nodes/ComfyUI-H3PromptStudio/*` are already tracked, so edits to them still show up in `git status`. New files under ignored paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
+The web GUI (`h3_gui.py`, `launch_gui.sh`, `README_GUI.md`, `DIRECTOR_MODE.md`) and `custom_nodes/ComfyUI-H3PromptStudio/` are published. `.gitignore` keeps local only: `AGENTS.md`, `REVISION.md`, GUI state (`config.json`, `prompt_history.json`, `outputs/`), `custom_nodes/ComfyUI-Qwen-Prompt-Rewriter/`, the custom node's `README.md`, `workflows/` and `*.json`. New files under those paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
 
 ## Constraints
 
