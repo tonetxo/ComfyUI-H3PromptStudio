@@ -46,7 +46,7 @@ Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags 
 
 ## Plano-secuencia tab (h3_gui.py)
 
-Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI's VideoConcat. `ONER_SYSTEM` is a copy of `onerSystem` in the SwarmUI H3PromptStudio extension (`Assets/h3_prompt_studio.js`), so keep the two in sync. There is no link to Swarm here: the user pastes the results. Saved files go to `outputs/plano_secuencia/`.
+Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI's VideoConcat. `ONER_SYSTEM` is a copy of `onerSystem` in the SwarmUI H3PromptStudio extension (`Assets/h3_prompt_studio.js`), so keep the two in sync. There is no link to Swarm here: the user pastes the results. Saved files go to `outputs/plano_secuencia/`: the pasteable `.txt`, a `.json` sidecar with the form, and `<stem>_refs/` with the images; "Load saved prompts" restores them (older saves without a sidecar restore only the prompts).
 
 ## State the GUI writes (don't hand-edit while it runs)
 
