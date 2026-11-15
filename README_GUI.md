@@ -38,6 +38,7 @@ Incluidos:
 - H3 Interaction
 - H3 Horror
 - H3 Action
+- H3 Fantasy (arte surrealista/fantástico; tolera prompts densos ou desordenados, como os do Prompt Transmuter)
 - Wan 2.x
 - LTX Video
 - LTX Video FLF

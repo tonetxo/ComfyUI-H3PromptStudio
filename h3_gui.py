@@ -82,7 +82,7 @@ DEFAULT_CONFIG = {
 }
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
-PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Interaction", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
+PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Interaction", "H3 Horror", "H3 Action", "H3 Fantasy", "Wan 2.x", "LTX Video", "LTX Video FLF"]
 DIRECTOR_TOTALS = ["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"]
 DIRECTOR_SHOTS = ["5","6","8","10","12","15","18","20","25","30"]
 # Director form values stored with each sequence, so a loaded package can be rebuilt as it was made.
@@ -125,6 +125,13 @@ PRESETS_DATA = {
         "motion": "Strong, continuous primary and secondary motion: body momentum, debris, dust, smoke, water, fabric, recoil, vibration and environmental reactions. Every impact should have visible consequences.",
         "audio": "Diegetic action audio tightly tied to visible events: impacts, machinery, footsteps, debris, alarms, pressure, wind, water. No music unless requested.",
         "negative": "Weightless movement; instant position changes; impossible inertia; frozen debris; frozen atmosphere; camera teleportation; duplicated bodies; random explosions; unwanted music/dialogue.",
+    },
+    "H3 Fantasy": {
+        "style": "surreal fantasy art brought to life as a living painting; keep the exact artistic references, materials and palette named in the scene (e.g. glazed ceramic mosaics, melting forms, impossible geometry) and render them consistently in every frame. The scene text may be dense, poetic or scrambled word salad: read it as a description of a single still artwork, extract its concrete anchors (main structures, landscape layers, water, sky, light direction, colors, materials, named artists and style percentages) and rebuild them into clear, grammatical spatial description; drop fragments that make no sense instead of inventing new subjects",
+        "camera": "slow majestic establishing movement that reveals the whole composition: gentle aerial drift, slow push-in or a wide arc around the main structure; keep the horizon, scale and layout of the artwork stable; no cuts",
+        "motion": "The artwork stays recognizable while it comes alive: clouds drift and billow, waterfalls pour and foam, rivers flow along their curves, mist and haze breathe across the valley, light shifts slowly across glazed surfaces with moving specular highlights, banners and foliage sway. Surreal elements move in their own logic: soft forms melt and re-form slowly, impossible staircases and geometries keep a consistent paradoxical structure instead of collapsing. Architecture stays solid unless the scene asks it to melt.",
+        "audio": "Atmospheric diegetic ambience of the place: rushing waterfalls, flowing river, wind over cliffs, distant birds, faint chimes or bells only if visible sources exist. No music unless requested.",
+        "negative": "Photorealistic reinterpretation that loses the painted or ceramic style; style drift between frames; structures collapsing or warping randomly; flickering mosaic patterns; frozen water or clouds; random new buildings or characters; legible text or lettering; watermarks; camera cuts; chaotic fast motion.",
     },
     "Wan 2.x": {
         "style": "photorealistic generative video, strong temporal consistency, clear subject silhouettes, robust motion readability",
