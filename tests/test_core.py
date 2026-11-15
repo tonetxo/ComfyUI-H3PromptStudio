@@ -230,5 +230,23 @@ class MotionAndReferenceHelpersTests(unittest.TestCase):
             self.assertEqual(qwen_nodes._get_gguf_models_dir(), Path("~/custom-gguf").expanduser())
 
 
+class DirectorTokenBudgetTests(unittest.TestCase):
+    def test_director_plan_max_tokens_scales_with_shots(self):
+        for mod in (h3_gui, studio_nodes):
+            with self.subTest(module=mod.__name__):
+                self.assertEqual(mod.director_plan_max_tokens(4), 4096)
+                self.assertEqual(mod.director_plan_max_tokens(36), 36 * 350 + 1500)
+
+    def test_studio_llamacpp_receives_max_tokens(self):
+        resp = mock.Mock(ok=True)
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        with mock.patch.object(studio_nodes.requests, "post", return_value=resp) as post:
+            studio_nodes.ollama_chat("http://127.0.0.1:8080", "m", [{"role": "user", "content": "x"}],
+                                     backend="llamacpp", max_tokens=9000)
+            self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 9000)
+            studio_nodes.ollama_chat("http://127.0.0.1:8080", "m", [{"role": "user", "content": "x"}], backend="llamacpp")
+            self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 4096)
+
+
 if __name__ == "__main__":
     unittest.main()

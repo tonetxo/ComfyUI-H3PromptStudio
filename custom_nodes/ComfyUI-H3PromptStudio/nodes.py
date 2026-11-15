@@ -511,6 +511,7 @@ def llamacpp_chat(
     model: str,
     messages: list,
     temperature: float = 0.2,
+    max_tokens: int = 4096,
 ) -> str:
     """Call a llama.cpp server (OpenAI-compatible /v1/chat/completions).
 
@@ -527,7 +528,7 @@ def llamacpp_chat(
         "model": model,
         "messages": _messages_to_openai(messages),
         "temperature": float(temperature),
-        "max_tokens": 4096,
+        "max_tokens": int(max_tokens),
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
         "repeat_penalty": 1.1,
@@ -549,6 +550,11 @@ def llamacpp_chat(
         raise RuntimeError(f"[H3 Prompt Studio] Unexpected llama.cpp response: {r.text[:500]}") from e
 
 
+def director_plan_max_tokens(shot_count: int) -> int:
+    """Token budget for the Director plan JSON: ~350 tokens per shot plus the continuity bible."""
+    return max(4096, int(shot_count) * 350 + 1500)
+
+
 def ollama_chat(
     url: str,
     model: str,
@@ -557,7 +563,9 @@ def ollama_chat(
     num_ctx: int = 32768,
     keep_alive: str = "0m",
     backend: str = "ollama",
+    max_tokens: Optional[int] = None,
 ) -> str:
+    """max_tokens only applies to llama.cpp (default 4096); Ollama keeps its own unlimited default."""
     if not model:
         raise ValueError("[H3 Prompt Studio] Model name is required.")
     if model == NO_LLAMACPP_MODELS:
@@ -565,7 +573,7 @@ def ollama_chat(
             "[H3 Prompt Studio] No llama.cpp models found. Start llama-server or configure gguf_models_dir in ~/.config/h3ps/settings.json."
         )
     if backend == "llamacpp":
-        return llamacpp_chat(url, model, messages, temperature)
+        return llamacpp_chat(url, model, messages, temperature, max_tokens=max_tokens or 4096)
     clean_url = sanitize_url(url)
     payload = {
         "model": model,
@@ -1408,6 +1416,7 @@ class H3_DirectorMode:
                 num_ctx,
                 backend=backend,
                 keep_alive="0m",
+                max_tokens=director_plan_max_tokens(count),
             )
             plan = extract_json(raw_plan)
             raw_shots = plan.get("shots")

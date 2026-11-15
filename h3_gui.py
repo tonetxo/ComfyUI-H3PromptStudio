@@ -757,6 +757,11 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
         raise RuntimeError(f"Respuesta inesperada de llama.cpp para '{model}': {r.text[:1000]}") from e
 
 
+def director_plan_max_tokens(shot_count: int) -> int:
+    """Token budget for the Director plan JSON: ~350 tokens per shot plus the continuity bible."""
+    return max(4096, int(shot_count) * 350 + 1500)
+
+
 def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None, max_tokens: Optional[int] = None) -> str:
     if not model:
         raise ValueError("No model selected.")
@@ -2408,7 +2413,7 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
         {"role":"user","content":json.dumps(planner_input, ensure_ascii=False, indent=2)}
-    ], td, track_stats=stats_log, max_tokens=4096)
+    ], td, track_stats=stats_log, max_tokens=director_plan_max_tokens(count))
     t_director = time.perf_counter() - t_d_start
 
     plan = extract_json(raw_plan)
