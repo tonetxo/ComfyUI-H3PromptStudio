@@ -1,7 +1,10 @@
 import base64
 import io
 import json
+import logging
 import re
+import time
+import urllib.parse
 import requests
 try:
     import torch
@@ -9,9 +12,11 @@ try:
 except ImportError:
     torch = None
     np = None
-from PIL import Image
+from PIL import Image, ImageOps
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
+
+logger = logging.getLogger("H3PromptStudio")
 
 # Presets and System Prompts ported faithfully from H3 Prompt Studio
 MODES = ["I2VA", "FLF2VA", "T2VA", "L2VA", "R2V"]
@@ -98,14 +103,31 @@ DIRECTOR_SYSTEM = """You are a continuity-focused film director and storyboard p
 DIRECTOR_PROMPT_SYSTEM = """You are a cinematic video prompt writer. Convert one storyboard shot plus the continuity bible into ONE production-ready English prompt for MiniMax H3 or LTX Video. The prompt must restate the critical continuity anchors needed for this shot, then describe framing, camera movement, explicit subject action, secondary physical motion, environmental reactions, lighting and diegetic audio. If the workflow is First-Last Frame (FLF2VA / LTX Video FLF), explicitly detail the visible physical trajectory from the initial frame (FIRST_FRAME) to the ending frame (LAST_FRAME). Use temporal progression only when helpful and keep each shot's action coherent. Do not invent changes to wardrobe, location, character appearance, lighting or props. Do not add music or dialogue unless explicitly specified. This prompt will be generated independently from neighboring shots, so it must be self-contained while remaining consistent with the continuity bible. If the input lists reference_tags (e.g. <Picture 1>, <Picture 2>), you MUST embed each listed tag verbatim inside the prompt, right next to the subject, location or object it depicts (e.g. "the captain from <Picture 1> walks into the hangar from <Picture 2>"). Never rename, renumber, translate or drop these tags. Output ONLY the prompt text."""
 
 
-def sanitize_url(url: Optional[str]) -> str:
-    """Ensure URL has proper scheme and fallback to default localhost Ollama."""
+_BLOCKED_SCHEMES = ("file:", "ftp:", "javascript:", "data:", "gopher:")
+
+
+def sanitize_url(url: Optional[str], default: str = "http://127.0.0.1:11434") -> str:
+    """Ensure URL has a safe http/https scheme and fallback to default localhost URL."""
     u = (url or "").strip()
     if not u:
-        return "http://127.0.0.1:11434"
-    if not u.startswith("http://") and not u.startswith("https://"):
+        u = default
+    if "://" not in u:
+        if u.lower().startswith(_BLOCKED_SCHEMES):
+            raise ValueError(f"[H3 Prompt Studio] Invalid URL '{url}': only http/https URLs are allowed.")
         u = "http://" + u
+    parsed = urllib.parse.urlparse(u)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"[H3 Prompt Studio] Invalid URL '{url}': only http/https URLs are allowed.")
     return u.rstrip("/")
+
+
+_MODEL_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
+_MODEL_CACHE_TTL = 5.0
+
+
+def invalidate_model_cache() -> None:
+    """Clear cached model lists for Ollama and llama.cpp."""
+    _MODEL_CACHE.clear()
 
 
 def free_vram() -> None:
@@ -123,15 +145,20 @@ def free_vram() -> None:
 def get_ollama_models(url: str = "http://127.0.0.1:11434") -> List[str]:
     """Fetch all installed models from Ollama (/api/tags)."""
     clean_url = sanitize_url(url)
+    cache_key = ("ollama", clean_url)
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < _MODEL_CACHE_TTL:
+        return list(cached[1])
     try:
         r = requests.get(clean_url + "/api/tags", timeout=3)
         if r.ok:
             models = [m.get("name", "").strip() for m in r.json().get("models", [])]
             models = sorted([m for m in models if m])
             if models:
+                _MODEL_CACHE[cache_key] = (time.monotonic(), list(models))
                 return models
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[H3 Prompt Studio] Failed to fetch Ollama models from %s: %s", clean_url, e)
     return [
         "llama3.2-vision:latest",
         "qwen2.5:latest",
@@ -172,18 +199,27 @@ def get_llamacpp_models(url: Optional[str] = None) -> List[str]:
     list is never empty.
     """
     settings = load_local_settings()
-    clean_url = sanitize_url(url or settings.get("llamacpp_url") or DEFAULT_LLAMACPP_URL)
+    clean_url = sanitize_url(url or settings.get("llamacpp_url") or DEFAULT_LLAMACPP_URL, default=DEFAULT_LLAMACPP_URL)
+    cache_key = ("llamacpp", clean_url)
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < _MODEL_CACHE_TTL:
+        return list(cached[1])
     models = []
+    server_ok = False
     try:
         r = requests.get(clean_url + "/v1/models", timeout=3)
         if r.ok:
+            server_ok = True
             models = sorted([m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[H3 Prompt Studio] Failed to fetch llama.cpp models from %s: %s", clean_url, e)
     for m in list(settings.get("llamacpp_extra_models") or []) + _scan_gguf_models():
         if m not in models:
             models.append(m)
-    return models or [NO_LLAMACPP_MODELS]
+    result = models or [NO_LLAMACPP_MODELS]
+    if server_ok:
+        _MODEL_CACHE[cache_key] = (time.monotonic(), list(result))
+    return result
 
 
 def _resolve_llamacpp_model(model: str) -> str:
@@ -234,8 +270,12 @@ def effective_model(ollama_model: str, llamacpp_model: str, backend: str) -> str
     return ollama_model
 
 
+VISION_MAX_SIDE = 2048
+VISION_JPEG_QUALITY = 90
+
+
 def tensor_to_base64(img_tensor) -> Optional[str]:
-    """Convert ComfyUI Image Tensor [B, H, W, C] to Base64 JPEG string."""
+    """Convert ComfyUI Image Tensor [B, H, W, C] to bounded-size Base64 RGB JPEG string."""
     if img_tensor is None:
         return None
     try:
@@ -246,33 +286,158 @@ def tensor_to_base64(img_tensor) -> Optional[str]:
             img_np = np.clip(i, 0, 255).astype(np.uint8)
             img = Image.fromarray(img_np)
         elif isinstance(img_tensor, Image.Image):
-            img = img_tensor
+            img = ImageOps.exif_transpose(img_tensor)
         else:
             return None
-        
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE), Image.LANCZOS)
+
         buffered = io.BytesIO()
-        img.save(buffered, format="JPEG", quality=95)
+        img.save(buffered, format="JPEG", quality=VISION_JPEG_QUALITY)
         return base64.b64encode(buffered.getvalue()).decode("ascii")
     except Exception as e:
-        print(f"[H3 Prompt Studio] Image conversion error: {e}")
+        logger.warning("[H3 Prompt Studio] Image conversion error: %s", e)
         return None
 
 
-def extract_json(text: str) -> Dict[str, Any]:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```$", "", text)
+def _repair_json(text: str) -> Dict[str, Any]:
+    """Attempt to repair a truncated JSON object by closing unclosed strings/arrays/objects."""
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    out = []
+    stack = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                open_ch = stack.pop()
+                if (ch == "}" and open_ch != "{") or (ch == "]" and open_ch != "["):
+                    continue
+        out.append(ch)
+    if in_str:
+        out.append('"')
+    while stack:
+        open_ch = stack.pop()
+        out.append("}" if open_ch == "{" else "]")
+    repaired = "".join(out)
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return json.loads(repaired, strict=False)
+
+
+def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    raw = text.strip()
+
+    # 1. Look for ```json ... ``` blocks
+    code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, flags=re.I)
+    for block in code_blocks:
+        b = block.strip()
+        if not b:
+            continue
+        try:
+            val = json.loads(b, strict=False)
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, list):
+                return {"items": val}
+        except Exception:
+            start, end = b.find("{"), b.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    val = json.loads(b[start:end + 1], strict=False)
+                    if isinstance(val, dict):
+                        return val
+                except Exception:
+                    try:
+                        return _repair_json(b[start:end + 1])
+                    except Exception:
+                        pass
+
+    # 2. Try direct json.loads
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
+        val = json.loads(raw, strict=False)
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, list):
+            return {"items": val}
+    except Exception:
+        pass
+
+    # 3. Try finding outermost { ... }
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 and end > start:
+        cand = raw[start:end + 1]
+        try:
+            val = json.loads(cand, strict=False)
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, list):
+                return {"items": val}
+        except Exception:
             try:
-                return json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
+                return _repair_json(cand)
+            except Exception:
                 pass
-        return {"raw_text": text}
+
+    return None
+
+
+def extract_json(text: str, fallback_key: str = "raw_output") -> Dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {
+            fallback_key: "",
+            "primary_actions": [],
+            "subject_motion": "No motion parsed",
+            "camera_trajectory": "",
+            "shots": [],
+        }
+
+    # If thinking tags are present, prioritize content outside <think>...</think>
+    candidates = []
+    if "<think>" in text and "</think>" in text:
+        parts = text.split("</think>", 1)
+        after_think = parts[1].strip()
+        inside_think = parts[0].replace("<think>", "").strip()
+        if after_think:
+            candidates.append(after_think)
+        if inside_think:
+            candidates.append(inside_think)
+
+    candidates.append(text)
+
+    for cand in candidates:
+        parsed = _try_parse_json(cand)
+        if parsed is not None:
+            return parsed
+
+    clean_text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.I).strip() or text
+    return {
+        fallback_key: clean_text,
+        "subject_motion": clean_text,
+        "primary_actions": [],
+        "camera_trajectory": "",
+        "continuity_bible": {},
+        "shots": [],
+    }
 
 
 def parse_seconds(value: Any, default: int) -> int:
@@ -285,17 +450,11 @@ def parse_seconds(value: Any, default: int) -> int:
     return secs if secs > 0 else default
 
 
-def ollama_unload_model(url: str, model: str) -> None:
+def ollama_unload_model(url: str, model: str, backend: str = "ollama") -> None:
     """Instruct Ollama to immediately unload a specific model from VRAM."""
-    if not model:
+    if not model or backend == "llamacpp":
         return
     clean_url = sanitize_url(url)
-    # llama.cpp: no per-model unload endpoint; sleep-idle frees VRAM automatically.
-    try:
-        if requests.get(clean_url + "/v1/models", timeout=2).ok:
-            return
-    except Exception:
-        pass
     try:
         requests.post(
             clean_url + "/api/generate",
@@ -303,27 +462,23 @@ def ollama_unload_model(url: str, model: str) -> None:
             timeout=5,
         )
     except Exception as e:
-        print(f"[H3 Prompt Studio] Warning unloading '{model}': {e}")
+        logger.warning("[H3 Prompt Studio] Warning unloading '%s': %s", model, e)
 
 
-def ollama_unload_all(url: str) -> None:
+def ollama_unload_all(url: str, backend: str = "ollama") -> None:
     """Query Ollama /api/ps and force-unload all active models to free 100% VRAM."""
+    if backend == "llamacpp":
+        return
     clean_url = sanitize_url(url)
-    # llama.cpp router has no /api/ps; its sleep-idle handles VRAM on its own.
-    try:
-        if requests.get(clean_url + "/v1/models", timeout=2).ok:
-            return
-    except Exception:
-        pass
     try:
         r = requests.get(clean_url + "/api/ps", timeout=5)
         if r.ok:
             for item in r.json().get("models", []):
                 m_name = item.get("name") or item.get("model")
                 if m_name:
-                    ollama_unload_model(clean_url, m_name)
+                    ollama_unload_model(clean_url, m_name, backend=backend)
     except Exception as e:
-        print(f"[H3 Prompt Studio] Warning in ollama_unload_all: {e}")
+        logger.warning("[H3 Prompt Studio] Warning in ollama_unload_all: %s", e)
 
 
 BACKENDS = ["ollama", "llamacpp"]
@@ -354,12 +509,17 @@ def llamacpp_chat(
     Thinking is disabled server-side via chat_template_kwargs; unload is handled
     by the server itself (sleep-idle), so keep_alive/unload do not apply.
     """
+    if not model or model == NO_LLAMACPP_MODELS:
+        raise ValueError(
+            "[H3 Prompt Studio] No llama.cpp models found. Start llama-server or configure gguf_models_dir in ~/.config/h3ps/settings.json."
+        )
     model = _resolve_llamacpp_model(model)
-    clean_url = sanitize_url(url)
+    clean_url = sanitize_url(url, default=DEFAULT_LLAMACPP_URL)
     payload = {
         "model": model,
         "messages": _messages_to_openai(messages),
         "temperature": float(temperature),
+        "max_tokens": 4096,
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
         "repeat_penalty": 1.1,
@@ -392,6 +552,10 @@ def ollama_chat(
 ) -> str:
     if not model:
         raise ValueError("[H3 Prompt Studio] Model name is required.")
+    if model == NO_LLAMACPP_MODELS:
+        raise ValueError(
+            "[H3 Prompt Studio] No llama.cpp models found. Start llama-server or configure gguf_models_dir in ~/.config/h3ps/settings.json."
+        )
     if backend == "llamacpp":
         return llamacpp_chat(url, model, messages, temperature)
     clean_url = sanitize_url(url)
@@ -450,27 +614,37 @@ def build_writer_prompt(
     else:
         audio_text = audio or preset_data['audio']
 
+    specific_requirements = []
+
+    if mode == "FLF2VA" or (analysis and isinstance(analysis, dict) and ("first_frame" in analysis or "first_frame_analysis" in analysis)):
+        specific_requirements.append("""
+CRITICAL FIRST-LAST FRAME (FLF) REQUIREMENT:
+This generation is in First-Last Frame interpolation mode (FLF2VA / LTX Video FLF).
+You MUST explicitly detail the continuous, physically grounded visual progression starting from the composition, subjects and pose of FIRST_FRAME and smoothly evolving into the target ending composition, subjects and pose of LAST_FRAME over the requested duration. Detail the intermediate transformations and camera movement.
+""")
+
     has_video = bool(custom_video and custom_video.strip()) or ("<Video" in (scene or "")) or ("<Video" in (constraints or ""))
     video_req = ""
     if has_video:
         v_note = custom_video.strip() if (custom_video and custom_video.strip()) else "Subject motion dynamics, pacing, performance and camera tracking follow <Video 1>."
         video_req = f"- Video anchor: `<Video 1>`. You MUST explicitly embed `<Video 1>` into the prompt (e.g., '{v_note}'). Coordinate subject motion and camera choreography with <Video 1>."
 
-    r2v_requirement = ""
     if mode == "R2V":
         extra_vid = f"\n{video_req}" if has_video else ""
-        r2v_requirement = f"""
+        specific_requirements.append(f"""
 CRITICAL R2V REQUIREMENT:
 This generation is in R2V (Reference-to-Video) mode. You MUST explicitly embed the reference anchor `<Audio 1>` (or `<Audio 0>` if specified) into the final prompt (e.g., 'Action, diegetic sound design and rhythm are precisely synchronized with <Audio 1>'). If visual reference analysis is present, also reference <Picture 1>.{extra_vid}
 NEVER omit the reference tags in the output.
-"""
+""")
     elif has_video:
-        r2v_requirement = f"""
+        specific_requirements.append(f"""
 CRITICAL VIDEO REFERENCE REQUIREMENT:
 A reference video is active in this generation.
 {video_req}
 NEVER omit the `<Video 1>` tag in the final prompt.
-"""
+""")
+
+    r2v_requirement = "\n".join(specific_requirements)
 
     return f"""Create one final production-ready prompt. PRIMARY TARGET: MiniMax H3 / Video Gen. WORKFLOW: {mode}. DURATION: {duration}. ASPECT RATIO: {aspect}. PRESET: {preset}.
 
@@ -680,7 +854,7 @@ class H3_PromptStudio_Unified:
 
             # Eagerly unload vision model to free GPU VRAM before Motion/Writer
             if unload_models_after_gen and (b64_first or b64_last) and v_model:
-                ollama_unload_model(ollama_url, v_model)
+                ollama_unload_model(ollama_url, v_model, backend=backend)
 
             # Step 2: Motion Director
             if enable_motion_director and analysis:
@@ -727,7 +901,7 @@ Translate the still image into visible, physically plausible motion. Include a c
                 motion_plan = extract_json(raw_motion)
 
                 if unload_models_after_gen and m_model and m_model != w_model:
-                    ollama_unload_model(ollama_url, m_model)
+                    ollama_unload_model(ollama_url, m_model, backend=backend)
 
             # Step 3: Cinematic Prompt Writer
             wp = build_writer_prompt(
@@ -762,7 +936,7 @@ Translate the still image into visible, physically plausible motion. Include a c
 
         finally:
             if unload_models_after_gen:
-                ollama_unload_all(ollama_url)
+                ollama_unload_all(ollama_url, backend=backend)
             free_vram()
 
         return (
@@ -838,10 +1012,19 @@ class H3_VisionAnalyzer:
                 parsed = extract_json(raw)
                 return (json.dumps(parsed, indent=2, ensure_ascii=False),)
 
+            elif b64_last:
+                messages = [
+                    {"role": "system", "content": VISION_SYSTEM},
+                    {"role": "user", "content": "Analyze this target reference image (LAST_FRAME). Return JSON only.", "images": [b64_last]},
+                ]
+                raw = ollama_chat(ollama_url, model, messages, temperature, num_ctx, backend=backend, keep_alive="0m")
+                parsed = extract_json(raw)
+                return (json.dumps(parsed, indent=2, ensure_ascii=False),)
+
             return ("{}",)
         finally:
             if unload_model and model:
-                ollama_unload_model(ollama_url, model)
+                ollama_unload_model(ollama_url, model, backend=backend)
             free_vram()
 
 
@@ -919,7 +1102,7 @@ Translate the visual elements into visible, physically plausible motion. If Firs
             return (json.dumps(parsed, indent=2, ensure_ascii=False),)
         finally:
             if unload_model and model:
-                ollama_unload_model(ollama_url, model)
+                ollama_unload_model(ollama_url, model, backend=backend)
             free_vram()
 
 
@@ -1030,7 +1213,7 @@ class H3_PromptWriter:
             return (final_prompt, neg_prompt)
         finally:
             if unload_model and model:
-                ollama_unload_model(ollama_url, model)
+                ollama_unload_model(ollama_url, model, backend=backend)
             free_vram()
 
 
@@ -1130,6 +1313,9 @@ class H3_DirectorMode:
         b64_last = tensor_to_base64(last_frame_image)
 
         try:
+            if (b64_first or b64_last) and not v_model:
+                raise ValueError("[H3 Prompt Studio] Vision model is required when reference images are provided.")
+
             if b64_first and b64_last:
                 raw_v1 = ollama_chat(
                     ollama_url,
@@ -1163,9 +1349,20 @@ class H3_DirectorMode:
                 )
                 ref_analysis = {"tag": "<Picture 1>", "role": "REFERENCE", "analysis": extract_json(raw_v1)}
                 ref_tags = ["<Picture 1>"]
+            elif b64_last:
+                raw_v2 = ollama_chat(
+                    ollama_url,
+                    v_model,
+                    [{"role": "system", "content": VISION_SYSTEM}, {"role": "user", "content": "Analyze LAST_FRAME for continuity bible. Return JSON only.", "images": [b64_last]}],
+                    0.15,
+                    num_ctx,
+                    backend=backend, keep_alive="0m",
+                )
+                ref_analysis = {"tag": "<Picture 1>", "role": "LAST_FRAME", "analysis": extract_json(raw_v2)}
+                ref_tags = ["<Picture 1>"]
 
             if unload_models_after_gen and (b64_first or b64_last) and v_model:
-                ollama_unload_model(ollama_url, v_model)
+                ollama_unload_model(ollama_url, v_model, backend=backend)
 
             total = int(total_duration)
             target = int(shot_target_duration)
@@ -1205,11 +1402,12 @@ class H3_DirectorMode:
                 keep_alive="0m",
             )
             plan = extract_json(raw_plan)
-            shots = plan.get("shots", [])
-            bible = plan.get("continuity_bible", {})
+            raw_shots = plan.get("shots")
+            shots = [s for s in raw_shots if isinstance(s, dict)] if isinstance(raw_shots, list) else []
+            bible = plan.get("continuity_bible") if isinstance(plan.get("continuity_bible"), dict) else {}
 
             if unload_models_after_gen and d_model and d_model != w_model:
-                ollama_unload_model(ollama_url, d_model)
+                ollama_unload_model(ollama_url, d_model, backend=backend)
 
             shot_prompts = []
             timeline = 0
@@ -1217,6 +1415,8 @@ class H3_DirectorMode:
                 dur = parse_seconds(shot.get("duration"), durations[min(i - 1, len(durations) - 1)])
                 shot_id = shot.get("shot_id") or f"SHOT_{i:02d}"
                 shot["shot_id"] = shot_id
+                shot["start_time"] = timeline
+                shot["end_time"] = timeline + dur
                 shot["duration"] = dur
                 payload = {
                     "target_workflow": workflow_mode,
@@ -1260,7 +1460,7 @@ class H3_DirectorMode:
             )
         finally:
             if unload_models_after_gen:
-                ollama_unload_all(ollama_url)
+                ollama_unload_all(ollama_url, backend=backend)
             free_vram()
 
 
