@@ -39,23 +39,24 @@ function installBackendSwitcher(nodeType) {
 
     // Collect model pairs: foo / foo_llamacpp
     const pairs = [];
-    const seen = new Set();
     for (const w of this.widgets || []) {
       if (w.name.endsWith("_llamacpp")) {
         const baseName = w.name.slice(0, -"_llamacpp".length);
         const base = findWidget(this, baseName);
         pairs.push({ baseName, base, cpp: w });
-        seen.add(w.name);
-        if (base) seen.add(baseName);
       }
     }
 
-    const sync = () => {
+    const sync = (fromUserSwitch = false) => {
       const backend = backendWidget.value;
       const url = backend === "llamacpp" ? LLAMACPP_URL : OLLAMA_URL;
-      if (urlWidget && urlWidget.value !== url) {
-        urlWidget.value = url;
-        if (urlWidget.callback) urlWidget.callback(url);
+      const otherDefaultUrl = backend === "llamacpp" ? OLLAMA_URL : LLAMACPP_URL;
+      const currentUrl = (urlWidget?.value || "").trim();
+      if (urlWidget && (fromUserSwitch || !currentUrl || currentUrl === otherDefaultUrl)) {
+        if (urlWidget.value !== url) {
+          urlWidget.value = url;
+          if (urlWidget.callback) urlWidget.callback(url);
+        }
       }
       for (const { base, cpp } of pairs) {
         if (!base || !cpp) continue;
@@ -72,19 +73,19 @@ function installBackendSwitcher(nodeType) {
       app.graph?.setDirtyCanvas?.(true, true);
     };
 
-    setTimeout(sync, 0);
+    setTimeout(() => sync(false), 0);
 
     const origConfigure = this.configure;
     this.configure = function (info) {
       const out = origConfigure ? origConfigure.apply(this, arguments) : undefined;
-      setTimeout(sync, 0);
+      setTimeout(() => sync(false), 0);
       return out;
     };
 
     const origCallback = backendWidget.callback;
     backendWidget.callback = (value) => {
       if (value !== undefined) backendWidget.value = value;
-      sync();
+      sync(true);
       if (origCallback) origCallback(value);
     };
 
@@ -192,12 +193,31 @@ function installPresetFill(nodeType) {
 
 async function rescanLlamacppModels() {
   try {
-    const resp = await fetch("/h3promptstudio/rescan_llamacpp", {
+    const resp = await api.fetchApi("/h3promptstudio/rescan_llamacpp", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
     const data = await resp.json();
     if (data.ok) {
+      if (Array.isArray(data.models) && data.models.length > 0) {
+        for (const node of app.graph?._nodes || []) {
+          if (!NODE_NAMES.includes(node?.type)) continue;
+          for (const w of node.widgets || []) {
+            if (!w.name.endsWith("_llamacpp") || !w.options) continue;
+            const merged = [...data.models];
+            for (const existing of w.options.values || []) {
+              if (existing && existing !== "(no llama.cpp models found)" && !merged.includes(existing)) {
+                merged.push(existing);
+              }
+            }
+            w.options.values = merged;
+            if (w.value === "(no llama.cpp models found)" || !w.value) {
+              w.value = data.models[0];
+            }
+          }
+        }
+        app.canvas?.setDirty?.(true, true);
+      }
       window.alert?.("llama.cpp rescan OK:\n" + data.message);
     } else {
       window.alert?.("llama.cpp rescan failed:\n" + (data.message || "unknown error"));

@@ -166,6 +166,7 @@ Converts a 20–180 second brief into sequential short shots connected by a shar
 | **`H3 Dialogue`** | Natural character performance, eye-line continuity, synchronized speech and subtle facial micro-expressions. |
 | **`H3 Horror`** | Oppressive atmosphere, restrained practical lighting, eerie secondary motion (smoke, dust, flickering lights). |
 | **`H3 Action`** | High-intensity momentum, visible physical impact, recoil, debris dynamics, motivated camera tracking. |
+| **`H3 Fantasy`** | Surreal/fantasy artwork brought to life: keeps named artists, materials and palette; untangles dense or scrambled prompts into clear spatial description; drifting clouds, flowing water, slow reveal camera. |
 | **`Wan 2.x`** | High temporal consistency, clear subject silhouettes, strong motion readability. |
 | **`LTX Video`** | Explicit temporal progression, fluid environmental dynamics (particles, water, cloth, foliage). |
 | **`LTX Video FLF`** | Smooth first-to-last frame trajectory interpolation, lighting continuity, deformation-free physics. |

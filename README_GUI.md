@@ -35,10 +35,13 @@ Incluidos:
 
 - H3 Cinematic
 - H3 Dialogue
+- H3 Interaction
 - H3 Horror
 - H3 Action
+- H3 Fantasy (arte surrealista/fantástico; tolera prompts densos ou desordenados, como os do Prompt Transmuter)
 - Wan 2.x
 - LTX Video
+- LTX Video FLF
 
 El preset rellena estilo, cámara, prioridades de movimiento, audio y restricciones negativas. Todos los campos siguen siendo editables.
 
@@ -134,11 +137,11 @@ Para ajustes propios de cada máquina, crea `~/.config/h3ps/settings.json`. Lo l
 
 ## Director Mode
 
-La pestaña **Director Mode** permite introducir una escena de 20–60 segundos, opcionalmente una referencia visual, y dividirla automáticamente en planos cortos consecutivos. El proceso crea una **Continuity Bible**, un storyboard y un prompt H3 independiente para cada plano.
+La pestaña **Director Mode** permite introducir una escena de 20–180 segundos (planos objetivo de 5–30 s), opcionalmente varias imágenes de referencia con etiquetas de rol/nombre (`<Picture 1>`, `<Picture 2>`, ...), y dividirla automáticamente en planos cortos consecutivos. El proceso crea una **Continuity Bible**, un storyboard y un prompt H3 independiente para cada plano.
 
-El selector `Motion model` se utiliza como **Director/Planner model** en este modo. Puedes seleccionar cualquier modelo Ollama que tengas instalado; no se presupone un modelo concreto.
+El selector `Motion model` se utiliza como **Director/Planner model** en este modo. Puedes seleccionar cualquier modelo instalado en Ollama o llama.cpp; no se presupone un modelo concreto.
 
-Las salidas se guardan con **Save Director package** en `outputs/director_sequence.json` y `outputs/director_shots/`.
+Las salidas se guardan con **Save Director package** en `outputs/director_sequence.json`, `outputs/reference_library.json` y `outputs/director_shots/`, además de archivarse con marca temporal en `outputs/director_packages/package_<timestamp>/`.
 
 ## Plano-secuencia
 
