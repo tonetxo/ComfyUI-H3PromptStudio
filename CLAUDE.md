@@ -10,7 +10,7 @@ The same pipeline exists in three separately maintained copies that have drifted
 
 | File | Role | Notes |
 |---|---|---|
-| `h3_gui.py` (~3400 lines) | Standalone Gradio app — the most feature-complete copy | Ollama **and** llama.cpp backends, MiniMax enhancer path, R2V references, Director & Plano-secuencia tabs, history, persisted UI state |
+| `h3_gui.py` (~3400 lines) | Standalone Gradio app — the most feature-complete copy | Ollama **and** llama.cpp backends, MiniMax enhancer path, R2V references, Director, Plano-secuencia & H3 Image tabs, history, persisted UI state |
 | `custom_nodes/ComfyUI-H3PromptStudio/` | ComfyUI node pack (newest node version, documented in `README.md`) | Has llama.cpp backend, `web/h3_backend_switcher.js`, and a `/h3promptstudio/rescan_llamacpp` route in `__init__.py` |
 | `nodes.py` + `__init__.py` (repo root) | Older ComfyUI node pack | Ollama only; no llama.cpp support |
 
@@ -49,16 +49,20 @@ Workflow modes: `T2VA`, `I2VA`, `FLF2VA`, `L2VA`, `R2V`. In R2V, reference tags 
 
 Writes one prompt per segment of a continuous take, for MiniMax H3 Ref + SwarmUI's VideoConcat. `ONER_SYSTEM` is a copy of `onerSystem` in the SwarmUI H3PromptStudio extension (`Assets/h3_prompt_studio.js`), so keep the two in sync. There is no link to Swarm here: the user pastes the results. Saved files go to `outputs/plano_secuencia/`: the pasteable `.txt`, a `.json` sidecar with the form, and `<stem>_refs/` with the images; "Load saved prompts" restores them (older saves without a sidecar restore only the prompts).
 
+## H3 Image tab (h3_gui.py)
+
+Writes MiniMax-H3-Image prompts (text-to-image, or editing with up to 16 `<Picture N>` inputs) with MiniMax's `h3-image-prompt-writing` skill. The skill is not vendored: `h3i_download_skill()` fetches SKILL.md, both guides and the LICENSE into `skills/h3-image-prompt-writing/` (gitignored, Community License) and `h3i_system_prompt()` builds the writer system prompt from them at run time (dropping the skill's rendering section). Input images go through `h3i_analyze_refs` (its own vision prompt, cached) unless "Send the images to the Writer" is checked. Optional rendering (`h3i_render`) calls the MiniMax API with `MINIMAX_API_KEY` and saves PNGs to `outputs/h3_image/` with `prompt` + `workflow` text chunks and a `.json` sidecar.
+
 ## State the GUI writes (don't hand-edit while it runs)
 
 - `config.json` — rewritten by `save_config()` on most actions. Its values (`keep_alive: "0m"`, llama.cpp backend, etc.) differ from `DEFAULT_CONFIG` in `h3_gui.py`.
 - `ui_state.json` — persisted form fields for main and Director tabs; uploaded references are copied into `outputs/ui_refs/`.
 - `prompt_history.json` — version history, capped at 100 entries (can be large).
-- `outputs/` — `h3_prompt.txt`, `vision_analysis.json`, `motion_plan.json`, `reference_library.json`, timestamped copies in `outputs/archive/`, Director exports in `outputs/director_shots/<shot_id>.txt` + `outputs/director_sequence.json` + `outputs/director_packages/package_<timestamp>/`, and Plano-secuencia saves in `outputs/plano_secuencia/`.
+- `outputs/` — `h3_prompt.txt`, `vision_analysis.json`, `motion_plan.json`, `reference_library.json`, timestamped copies in `outputs/archive/`, Director exports in `outputs/director_shots/<shot_id>.txt` + `outputs/director_sequence.json` + `outputs/director_packages/package_<timestamp>/`, Plano-secuencia saves in `outputs/plano_secuencia/`, and H3 Image renders in `outputs/h3_image/`.
 
 ## Git quirks
 
-The web GUI (`h3_gui.py`, `launch_gui.sh`, `README_GUI.md`, `DIRECTOR_MODE.md`) and `custom_nodes/ComfyUI-H3PromptStudio/` are published. `.gitignore` keeps local only: `AGENTS.md`, `REVISION.md`, GUI state (`config.json`, `prompt_history.json`, `outputs/`), `custom_nodes/ComfyUI-Qwen-Prompt-Rewriter/`, the custom node's `README.md`, `workflows/` and `*.json`. New files under those paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
+The web GUI (`h3_gui.py`, `launch_gui.sh`, `README_GUI.md`, `DIRECTOR_MODE.md`) and `custom_nodes/ComfyUI-H3PromptStudio/` are published. `.gitignore` keeps local only: `AGENTS.md`, `REVISION.md`, GUI state (`config.json`, `prompt_history.json`, `outputs/`), `custom_nodes/ComfyUI-Qwen-Prompt-Rewriter/`, the custom node's `README.md`, the downloaded `skills/`, `workflows/` and `*.json`. New files under those paths (e.g. new JSON workflows in `workflows/`) will not be picked up without `git add -f`. User-facing error strings in the code are partly in Spanish; keep the surrounding language when editing them.
 
 ## Constraints
 

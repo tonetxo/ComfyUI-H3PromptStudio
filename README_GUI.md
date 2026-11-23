@@ -148,3 +148,14 @@ Las salidas se guardan con **Save Director package** en `outputs/director_sequen
 La pestaña **Plano-secuencia** escribe un prompt por segmento de una toma continua, para MiniMax H3 Ref y VideoConcat de SwarmUI. Usa los modelos Vision y Writer seleccionados en la pestaña principal y necesita al menos una imagen de referencia y dos duraciones.
 
 No hay conexión con SwarmUI: los resultados se pegan a mano. **Save prompts (txt)** los guarda en `outputs/plano_secuencia/`.
+
+## H3 Image
+
+La pestaña **H3 Image** escribe prompts para **MiniMax-H3-Image** (texto a imagen, o edición con hasta 16 imágenes de entrada) siguiendo el skill oficial [`h3-image-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills). Usa los modelos Vision y Writer de la pestaña principal.
+
+- El skill (SKILL.md, guías `t2i-en.txt`/`edit-en.txt` y su LICENSE) se descarga de GitHub en el primer uso a `skills/h3-image-prompt-writing/` (fuera de git, por la MiniMax-H3-Image Community License). **🔄 Update skill from GitHub** lo actualiza.
+- Sin imágenes es texto a imagen; con imágenes es edición y se citan como `<Picture 1>`, `<Picture 2>`… en el orden de subida. Por defecto el modelo Vision analiza cada imagen; si el Writer es multimodal, marca **Send the images to the Writer** para que las vea directamente.
+- **Aspect ratio** `Auto` deja que el Writer lo elija (entre 1:3 y 3:1); **Options** pide hasta 3 variantes.
+- **Render with the MiniMax API** (opcional) necesita `MINIMAX_API_KEY` en el entorno, o `minimax_api_key` en `~/.config/h3ps/settings.json` (`MINIMAX_API_BASE` / `minimax_api_base` para la plataforma China). Las imágenes se guardan en `outputs/h3_image/` como PNG con el prompt y la petición completa en los metadatos (`prompt`, `workflow`) y un `.json` al lado.
+
+Powered by MiniMax-H3-Image.

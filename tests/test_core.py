@@ -230,6 +230,38 @@ class MotionAndReferenceHelpersTests(unittest.TestCase):
             self.assertEqual(qwen_nodes._get_gguf_models_dir(), Path("~/custom-gguf").expanduser())
 
 
+class H3ImageTests(unittest.TestCase):
+    def test_parse_options_ratio_and_fences(self):
+        raw = ("<think>x</think>\n=== OPTION 1 ===\n```text\nA poster \"雨夜集市\".\n```\n\nAspect ratio: 3:4\n"
+               "=== OPTION 2 ===\nA wide scene.\n**Aspect ratio:** 16:9\n")
+        self.assertEqual(h3_gui.parse_h3i_options(raw),
+                         [{"prompt": 'A poster "雨夜集市".', "ratio": "3:4"}, {"prompt": "A wide scene.", "ratio": "16:9"}])
+        self.assertEqual(h3_gui.parse_h3i_options(raw, "1:1")[1]["ratio"], "1:1")
+        # Out-of-range ratios fall back instead of reaching the API.
+        self.assertEqual(h3_gui.parse_h3i_options("Prompt.\nAspect ratio: 5:1"), [{"prompt": "Prompt.", "ratio": "1:1"}])
+        self.assertEqual(h3_gui.parse_h3i_options("  "), [])
+
+    def test_skill_rules_drop_frontmatter_and_rendering(self):
+        md = "---\nname: x\n---\n# Title\n## Writing rules\nkeep\n## Rendering the prompt\ndrop\n### API\ndrop\n## Final check\nkeep too\n"
+        out = h3_gui.h3i_skill_rules(md)
+        self.assertNotIn("name: x", out)
+        self.assertNotIn("drop", out)
+        self.assertIn("keep too", out)
+
+    def test_png_embeds_workflow(self):
+        import io, json, tempfile
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buf, format="JPEG")
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "out.png"
+            h3_gui.h3i_save_png(buf.getvalue(), dest, {"prompt": "p", "request": {"n": 1}})
+            with Image.open(dest) as img:
+                self.assertEqual(img.format, "PNG")
+                self.assertEqual(img.text["prompt"], "p")
+                self.assertEqual(json.loads(img.text["workflow"])["request"], {"n": 1})
+
+
 class DirectorTokenBudgetTests(unittest.TestCase):
     def test_director_plan_max_tokens_scales_with_shots(self):
         for mod in (h3_gui, studio_nodes):

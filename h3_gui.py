@@ -1660,6 +1660,9 @@ def _persist_refs(state: Dict[str, Any]) -> Dict[str, Any]:
     o_refs = out.get("o_ref_state")
     if isinstance(o_refs, list):
         out["o_ref_state"] = [_copy_ref_to_persistent(p, "oner") for p in o_refs]
+    h_refs = out.get("h_ref_state")
+    if isinstance(h_refs, list):
+        out["h_ref_state"] = [_copy_ref_to_persistent(p, "h3_image") for p in h_refs]
     return out
 
 
@@ -2793,6 +2796,317 @@ def load_oner(name: Optional[str]):
              gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs)
 
 
+# ---- H3 Image: MiniMax-H3-Image prompts written with MiniMax's h3-image-prompt-writing skill ----
+# The skill is downloaded on first use into skills/ (gitignored: it is under the MiniMax-H3-Image
+# Community License, so it is fetched from MiniMax rather than redistributed with this repo).
+H3I_SKILL_DIR = ROOT / "skills" / "h3-image-prompt-writing"
+_H3I_RAW = "https://raw.githubusercontent.com/MiniMax-AI/MiniMax-H3-Image/main/"
+H3I_SKILL_FILES = {
+    "SKILL.md": _H3I_RAW + "skills/h3-image-prompt-writing/SKILL.md",
+    "references/t2i-en.txt": _H3I_RAW + "skills/h3-image-prompt-writing/references/t2i-en.txt",
+    "references/edit-en.txt": _H3I_RAW + "skills/h3-image-prompt-writing/references/edit-en.txt",
+    "LICENSE": _H3I_RAW + "LICENSE",
+}
+H3I_MAX_REFS = 16  # MiniMax-H3-Image editing accepts up to 16 images.
+H3I_ASPECTS = ["Auto", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9", "9:21", "3:1", "1:3"]
+H3I_DIR = ROOT / "outputs" / "h3_image"
+H3I_API_DEFAULT = "https://api.minimax.io"
+H3I_VISION_SYSTEM = """You are a forensic visual analyst preparing a source image for image editing. Describe only what is visible. Do not guess hidden parts, unreadable text, exact color codes or unfamiliar identities. Return valid JSON only with keys: image_type, layout, subjects (each with position such as left/right/foreground, count, appearance, colors, materials, pose or state), background, lighting, style, visible_text (every clearly readable line transcribed exactly, with its position; [] if none), ambiguities."""
+H3I_PREAMBLE = """You run MiniMax's h3-image-prompt-writing skill inside a prompt studio. Follow the skill and the guide below exactly.
+{image_note}
+Never ask questions, explain, or mention rendering or API keys. Fill ordinary gaps yourself.
+
+OUTPUT FORMAT (this replaces the skill's markdown output format):
+- Write the prompt as plain text, with no code fences, headings or commentary.
+- End each prompt with a final line exactly: Aspect ratio: W:H
+- When several options are requested, put a line === OPTION N === before each option."""
+H3I_NOTE_ANALYSIS = "You cannot see the input images. Each <Picture N> comes with its pixel size and a written analysis by a vision model: treat the analysis as what the image shows and do not add details it does not support."
+H3I_NOTE_IMAGES = "The input images are attached to the request in <Picture N> order. Look at every one of them before writing."
+H3I_NOTE_T2I = "There are no input images: this is text-to-image."
+_h3i_vision_cache: Dict[Any, list] = {}
+
+
+def h3i_download_skill() -> str:
+    """Download (or update) the skill files from MiniMax's repository."""
+    for rel, url in H3I_SKILL_FILES.items():
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError(f"No se pudo descargar el skill ({rel}): {e}") from e
+        dest = H3I_SKILL_DIR / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(dest, r.text)
+    return f"Skill actualizado en {H3I_SKILL_DIR}"
+
+
+def h3i_skill_status() -> str:
+    path = H3I_SKILL_DIR / "SKILL.md"
+    if not path.exists():
+        return "Skill no descargado: se descargará de GitHub en el primer uso."
+    return f"Skill: {H3I_SKILL_DIR} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(path.stat().st_mtime))})"
+
+
+def h3i_skill_rules(skill_md: str) -> str:
+    """SKILL.md without its frontmatter and its rendering section (the studio renders on its own)."""
+    text = re.sub(r"\A---\n.*?\n---\n", "", skill_md or "", flags=re.S)
+    text = re.sub(r"^## Rendering the prompt\n.*?(?=^## )", "", text, flags=re.S | re.M)
+    return text.strip()
+
+
+def h3i_system_prompt(task: str, image_note: str) -> str:
+    guide = "references/edit-en.txt" if task == "edit" else "references/t2i-en.txt"
+    if not all((H3I_SKILL_DIR / rel).exists() for rel in ("SKILL.md", guide)):
+        h3i_download_skill()
+    skill = h3i_skill_rules((H3I_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8"))
+    guide_text = (H3I_SKILL_DIR / guide).read_text(encoding="utf-8").strip()
+    return f"{H3I_PREAMBLE.format(image_note=image_note)}\n\n=== SKILL ===\n{skill}\n\n=== GUIDE ({guide}) ===\n{guide_text}"
+
+
+def _ratio_ok(w: int, h: int) -> bool:
+    return w > 0 and h > 0 and 1 / 3 <= w / h <= 3
+
+
+def parse_h3i_options(text: str, forced_ratio: str = "") -> list[dict]:
+    """Split writer output into [{"prompt", "ratio"}]. A ratio chosen in the UI overrides the model's."""
+    clean = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
+    clean = re.sub(r"^[ \t]*```[a-z]*[ \t]*$", "", clean, flags=re.M | re.I)
+    chunks = re.split(r"^[ \t]*=+[ \t]*OPTION[ \t]+\d+[ \t]*=+[ \t]*$", clean, flags=re.M | re.I)
+    options = []
+    for chunk in chunks:
+        ratio = ""
+        m = None
+        for m in re.finditer(r"^[ \t*_]*Aspect ratio[ \t*_]*:[ \t*_]*(\d+)[ \t]*[:x×/][ \t]*(\d+)[ \t*_.]*$", chunk, flags=re.M | re.I):
+            pass
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            ratio = f"{w}:{h}" if _ratio_ok(w, h) else ""
+            chunk = chunk[:m.start()] + chunk[m.end():]
+        prompt = chunk.strip()
+        if prompt:
+            options.append({"prompt": prompt, "ratio": forced_ratio or ratio or "1:1"})
+    return options
+
+
+def _h3i_size(path: str) -> str:
+    try:
+        with Image.open(path) as img:
+            from PIL import ImageOps
+            w, h = ImageOps.exif_transpose(img).size
+        return f"{w}x{h} px"
+    except Exception:
+        return "unknown size"
+
+
+def h3i_analyze_refs(cfg: Dict[str, Any], paths: list[str], temperature: float, track_stats: Optional[list] = None) -> list[dict]:
+    model = cfg.get("vision_model", "")
+    if not model:
+        raise ValueError("Has cargado imágenes: selecciona un Vision model en la pestaña principal (o marca que el Writer vea las imágenes).")
+    if model_supports_vision(cfg["ollama_url"], model, cfg.get("backend", "ollama")) is False:
+        raise ValueError(f"El modelo '{model}' no declara capacidad de Vision en Ollama.")
+    key = (_path_mtime_key(paths), model, cfg.get("backend"), float(temperature))
+    cached = _h3i_vision_cache.get(key)
+    if cached is not None:
+        return cached
+    out = []
+    for i, path in enumerate(paths, 1):
+        raw = ollama_chat(cfg, model, [
+            {"role": "system", "content": H3I_VISION_SYSTEM},
+            {"role": "user", "content": f"Analyze <Picture {i}> as a source image for an edit. Return valid JSON only.", "images": [image_to_b64(path)]},
+        ], temperature, track_stats=track_stats)
+        out.append({"tag": f"<Picture {i}>", "filename": Path(path).name, "size": _h3i_size(path), "analysis": extract_json(raw)})
+    if len(_h3i_vision_cache) >= _MAX_MEMORY_CACHE:
+        del _h3i_vision_cache[next(iter(_h3i_vision_cache))]
+    _h3i_vision_cache[key] = out
+    return out
+
+
+def h3i_generate(brief, refs, aspect, options_count, writer_sees_images,
+                 backend, ollama_url, vision_model, writer_model, tv, tw, num_ctx, keep_alive):
+    """Write MiniMax-H3-Image prompts. Returns (options, analysis_json, status)."""
+    cfg = load_config()
+    cfg.update({
+        "backend": backend,
+        "ollama_url": ollama_url.strip() or cfg["ollama_url"],
+        "vision_model": (vision_model or "").strip(),
+        "writer_model": (writer_model or "").strip(),
+        "temperature_vision": float(tv),
+        "temperature_writer": float(tw),
+        "num_ctx": int(num_ctx),
+        "keep_alive": keep_alive,
+    })
+    save_config(cfg)
+    if not (brief or "").strip():
+        raise ValueError("Describe la imagen primero.")
+    paths = [p for p in extract_paths(refs) if Path(p).exists()]
+    if len(paths) > H3I_MAX_REFS:
+        raise ValueError(f"MiniMax-H3-Image admite como máximo {H3I_MAX_REFS} imágenes.")
+    if not cfg["writer_model"]:
+        raise ValueError("Selecciona un Writer model en la pestaña principal.")
+    if is_minimax_enhancer(cfg["writer_model"]):
+        raise ValueError("El enhancer de MiniMax es para vídeo. Selecciona un modelo general como Writer.")
+    task = "edit" if paths else "t2i"
+    n = max(1, min(3, int(options_count or 1)))
+    forced = "" if aspect in (None, "", "Auto") else aspect
+    stats: list[dict] = []
+    t0 = time.perf_counter()
+    library: list[dict] = []
+    images_b64: list[str] = []
+    if not paths:
+        note = H3I_NOTE_T2I
+    elif writer_sees_images:
+        note = H3I_NOTE_IMAGES
+        images_b64 = [image_to_b64(p) for p in paths]
+    else:
+        note = H3I_NOTE_ANALYSIS
+        library = h3i_analyze_refs(cfg, paths, tv, track_stats=stats)
+    if paths:
+        pictures = "\n\n".join(
+            f"{r['tag']} ({r['filename']}, {r['size']}):\n{json.dumps(r['analysis'], ensure_ascii=False, indent=2)}" for r in library
+        ) if library else "\n".join(f"<Picture {i}> ({Path(p).name}, {_h3i_size(p)})" for i, p in enumerate(paths, 1))
+        source = f"TASK: editing with {len(paths)} input image(s), named <Picture 1> to <Picture {len(paths)}> in order.\n\nINPUT IMAGES:\n{pictures}"
+    else:
+        source = "TASK: text-to-image (no input images)."
+    ratio_line = f"Use exactly {forced}." if forced else "Choose it from the layout (between 1:3 and 3:1)."
+    user = (f"{source}\n\nREQUEST:\n{brief.strip()}\n\nASPECT RATIO: {ratio_line}\n\n"
+            f"Write {n} prompt{'s with clearly different takes' if n > 1 else ''}.")
+    message = {"role": "user", "content": user}
+    if images_b64:
+        message["images"] = images_b64
+    max_tokens = max(int(cfg.get("max_tokens") or 4096), n * 1500)
+    raw = ollama_chat(cfg, cfg["writer_model"], [{"role": "system", "content": h3i_system_prompt(task, note)}, message],
+                      tw, track_stats=stats, max_tokens=max_tokens)
+    if keep_alive == "0m":
+        ollama_unload_all(cfg["ollama_url"], backend=cfg.get("backend", "ollama"))
+    options = parse_h3i_options(raw, forced)
+    if not options:
+        raise ValueError(f"El modelo no devolvió ningún prompt: {raw.strip()[:200]}")
+    warnings = []
+    if len(options) != n:
+        warnings.append(f"se pedían {n} opciones y llegaron {len(options)}")
+    unknown = sorted({int(x) for o in options for x in re.findall(r"<Picture\s+(\d+)>", o["prompt"], flags=re.I) if not 1 <= int(x) <= len(paths)})
+    if unknown:
+        warnings.append(f"cita imágenes que no existen ({', '.join(map(str, unknown))})")
+    kind = f"edición con {len(paths)} imágenes" if paths else "texto a imagen"
+    status = (f"⚠️ {'; '.join(warnings)}" if warnings else f"OK: {len(options)} prompt(s), {kind}") + f" (⏱️ {time.perf_counter() - t0:.1f}s)"
+    analysis = json.dumps(library, ensure_ascii=False, indent=2) if library else ""
+    return options, analysis, status
+
+
+def h3i_option_choices(options: list[dict]) -> list[tuple[str, int]]:
+    return [(f"Opción {i} · {o.get('ratio', '')} · {' '.join(o.get('prompt', '').split())[:50]}…", i - 1) for i, o in enumerate(options or [], 1)]
+
+
+def _h3i_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"):
+            return "image/heic"
+        if brand in (b"mif1", b"msf1"):
+            return "image/heif"
+    return None
+
+
+def h3i_save_png(data: bytes, dest: Path, workflow: Dict[str, Any]) -> None:
+    """Save as PNG with the prompt and the full request workflow embedded as text chunks."""
+    from PIL.PngImagePlugin import PngInfo
+    info = PngInfo()
+    info.add_text("prompt", str(workflow.get("prompt", "")))
+    info.add_text("workflow", json.dumps(workflow, ensure_ascii=False))
+    with Image.open(io.BytesIO(data)) as img:
+        img.save(dest, format="PNG", pnginfo=info)
+
+
+def h3i_render(prompt, ratio, refs, area, n, enhance, brief="", writer_model="", vision_model=""):
+    """Render the prompt through the MiniMax API. Returns (image paths, status)."""
+    settings = load_local_settings()
+    key = os.environ.get("MINIMAX_API_KEY") or str(settings.get("minimax_api_key") or "")
+    if not key:
+        raise ValueError("Define MINIMAX_API_KEY (o minimax_api_key en ~/.config/h3ps/settings.json) para renderizar.")
+    base = sanitize_url(os.environ.get("MINIMAX_API_BASE") or settings.get("minimax_api_base") or H3I_API_DEFAULT,
+                        default=H3I_API_DEFAULT)
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("Genera o escribe un prompt primero.")
+    ratio = (ratio or "").strip()
+    m = re.fullmatch(r"(\d+)\s*:\s*(\d+)", ratio)
+    if ratio and not (m and _ratio_ok(int(m.group(1)), int(m.group(2)))):
+        raise ValueError("Aspect ratio debe ser W:H entre 1:3 y 3:1, por ejemplo 16:9.")
+    paths = [p for p in extract_paths(refs) if Path(p).exists()]
+    body: Dict[str, Any] = {"model": "MiniMax-H3-Image", "prompt": prompt, "n": max(1, min(10, int(n or 1))),
+                            "area": area or "4K", "response_format": "url", "output_format": "png"}
+    if ratio:
+        body["aspect_ratio"] = f"{m.group(1)}:{m.group(2)}"
+    images = []
+    if paths:
+        endpoint = "/v1/images/edits"
+        for p in paths:
+            data = Path(p).read_bytes()
+            mime = _h3i_mime(data)
+            if mime is None:
+                raise ValueError(f"Formato no admitido: {Path(p).name} (usa JPG, PNG, WebP, HEIC o HEIF)")
+            images.append({"image_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"})
+    else:
+        endpoint = "/v1/images/generations"
+        if not enhance:
+            if not ratio:
+                raise ValueError("Indica un aspect ratio, o activa el enhance de la API para que lo elija ella.")
+            body["disable_prompt_enhanced"] = True
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(base + endpoint, json={**body, **({"images": images} if images else {})},
+                          headers={"Authorization": f"Bearer {key}"}, timeout=900)
+    except requests.RequestException as e:
+        raise RuntimeError(f"No se pudo conectar con {base}: {e}") from e
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        result = r.json()
+    except ValueError:
+        raise RuntimeError("La API devolvió una respuesta que no es JSON.") from None
+    status_resp = result.get("base_resp") or {}
+    if status_resp.get("status_code"):
+        raise RuntimeError(f"Error de la API {status_resp.get('status_code')}: {status_resp.get('status_msg')}")
+    items = result.get("data") or []
+    if not items:
+        raise RuntimeError(f"La API no devolvió imágenes: {json.dumps(result)[:300]}")
+    H3I_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"h3_image_{time.strftime('%Y%m%d_%H%M%S')}"
+    workflow = {
+        "tool": "MiniMax H3 Prompt Studio · H3 Image", "skill": "h3-image-prompt-writing",
+        "endpoint": base + endpoint, "request": {**body, "images": [Path(p).name for p in paths]},
+        "prompt": prompt, "brief": brief or "", "writer_model": writer_model or "", "vision_model": vision_model or "",
+        "request_id": result.get("request_id"),
+    }
+    saved, failed = [], []
+    for i, item in enumerate(items, 1):
+        if item.get("error") or not item.get("url"):
+            failed.append(f"imagen {i}: {item.get('error') or 'sin URL'}")
+            continue
+        try:
+            dl = requests.get(item["url"], timeout=300)
+            dl.raise_for_status()
+            dest = H3I_DIR / f"{stem}_{i}.png"
+            meta = {**workflow, "index": i, "size": item.get("size"), "revised_prompt": item.get("revised_prompt") or ""}
+            h3i_save_png(dl.content, dest, meta)
+            _atomic_write_text(dest.with_suffix(".json"), json.dumps(meta, indent=2, ensure_ascii=False))
+            saved.append(str(dest))
+        except Exception as e:
+            failed.append(f"imagen {i}: {e}")
+    if not saved:
+        raise RuntimeError("; ".join(failed) or "No se guardó ninguna imagen.")
+    status = f"OK: {len(saved)} imagen(es) en {H3I_DIR} (⏱️ {time.perf_counter() - t0:.1f}s)"
+    if failed:
+        status += f" · ⚠️ {'; '.join(failed)}"
+    return saved, status
+
+
 # Reference thumbnails show the whole image: margin around it, and extra room below for the caption badge.
 REF_GALLERY_HEIGHT = 380
 REF_GALLERY_CSS = """
@@ -3061,6 +3375,50 @@ def build_ui():
                     o_main = gr.Textbox(label="Main prompt (segment 1): paste into Swarm's prompt", lines=14, buttons=["copy"], value=ui_state.get("o_main", ""))
                     o_sections = gr.Textbox(label="Section Prompts (segments 2+)", lines=16, buttons=["copy"], value=ui_state.get("o_sections", ""))
                     o_final_frames = gr.Textbox(label="Final frames: first value to Text2Video Frames, all of them to Section Durations", interactive=False, buttons=["copy"], value=ui_state.get("o_final_frames", ""))
+
+        with gr.Tab("H3 Image"):
+            gr.Markdown("## H3 Image\nPrompts for **MiniMax-H3-Image**: text-to-image, or editing with up to 16 reference images. "
+                        "Written with MiniMax's [`h3-image-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills) skill, "
+                        "using the Vision and Writer models selected in the main tab. Powered by MiniMax-H3-Image.")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    h_brief = gr.Textbox(label="Idea, brief or existing prompt", lines=6, value=ui_state.get("h_brief", ""),
+                                         placeholder="A 3:4 poster for a night market in the rain, titled \"雨夜集市\"… With images: what to change, combine or borrow.")
+                    saved_h_items = [p for p in ui_state.get("h_ref_state", []) if Path(p).exists()]
+                    h_ref_state = gr.State(saved_h_items)
+                    h_selected_ref_idx = gr.State(None)
+                    h_file = gr.File(label="Input images for editing (optional; the order sets <Picture N>, max 16)", file_count="multiple", file_types=["image"], type="filepath")
+                    h_refs = gr.Gallery(label="Input images (click one to select and delete)", columns=4, height=REF_GALLERY_HEIGHT, object_fit="contain",
+                                        elem_classes="ref-gallery", type="filepath", interactive=True, value=ref_gallery_items(saved_h_items, tagged=True))
+                    with gr.Row():
+                        h_remove_selected = gr.Button("🗑️ Eliminar seleccionada", size="sm", interactive=False)
+                        h_clear_refs = gr.Button("🧹 Borrar todas las imágenes", size="sm", variant="secondary")
+                    with gr.Row():
+                        h_aspect = gr.Dropdown(H3I_ASPECTS, value=ui_state.get("h_aspect", "Auto"), label="Aspect ratio")
+                        h_options_count = gr.Dropdown([1, 2, 3], value=ui_state.get("h_options_count", 1), label="Options")
+                    h_writer_sees = gr.Checkbox(value=ui_state.get("h_writer_sees", False), label="Send the images to the Writer (multimodal writer; skips the Vision analysis)")
+                    h_generate = gr.Button("Generate image prompt", variant="primary", size="lg")
+                    with gr.Accordion("Render with the MiniMax API", open=False):
+                        gr.Markdown("Needs `MINIMAX_API_KEY` in the environment (or `minimax_api_key` in `~/.config/h3ps/settings.json`); "
+                                    "China platform: `MINIMAX_API_BASE=https://api.minimax.cn`. PNGs go to `outputs/h3_image/` with the full request embedded as metadata.")
+                        with gr.Row():
+                            h_area = gr.Dropdown(["4K", "2K", "1K"], value=ui_state.get("h_area", "4K"), label="Area")
+                            h_n = gr.Slider(1, 4, value=ui_state.get("h_n", 1), step=1, label="Images")
+                        h_enhance = gr.Checkbox(value=ui_state.get("h_enhance", False), label="Let the API expand the prompt (text-to-image; edits are always expanded)")
+                        h_render = gr.Button("Render image", variant="secondary")
+                    with gr.Row():
+                        h_skill_update = gr.Button("🔄 Update skill from GitHub", size="sm")
+                    h_skill_info = gr.Textbox(label="Skill", interactive=False, value=h3i_skill_status())
+                with gr.Column(scale=1):
+                    h_status = gr.Textbox(label="Status", interactive=False, value=ui_state.get("h_status", ""))
+                    saved_h_options = ui_state.get("h_options", []) if isinstance(ui_state.get("h_options"), list) else []
+                    h_options_state = gr.State(saved_h_options)
+                    h_option_sel = gr.Dropdown(choices=h3i_option_choices(saved_h_options), value=0 if saved_h_options else None, label="Option", interactive=True)
+                    h_prompt = gr.Textbox(label="H3 Image prompt (editable)", lines=14, buttons=["copy"], value=ui_state.get("h_prompt", ""))
+                    h_ratio = gr.Textbox(label="Aspect ratio (W:H)", value=ui_state.get("h_ratio", ""), buttons=["copy"])
+                    h_gallery = gr.Gallery(label="Rendered images", columns=2, height=REF_GALLERY_HEIGHT, object_fit="contain", interactive=False)
+                    with gr.Accordion("Vision analysis of the input images", open=False):
+                        h_analysis = gr.Code(language="json", lines=10, value="")
 
         def on_mode_change(m):
             if m == "FLF2VA":
@@ -3445,6 +3803,65 @@ def build_ui():
                      outputs=[o_main, o_sections, o_final_frames, o_status, o_ref_state, o_refs, o_selected_ref_idx, o_remove_selected,
                               o_scene, o_frames, o_ref_labels, o_style, o_audio, o_dialogue])
         app.load(refresh_oner_selector, outputs=o_saved_selector)
+
+        # ---- H3 Image ----
+        h_save_fields = [h_brief, h_ref_state, h_aspect, h_options_count, h_writer_sees, h_area, h_n, h_enhance, h_prompt, h_ratio]
+        h_save_keys = ["h_brief", "h_ref_state", "h_aspect", "h_options_count", "h_writer_sees", "h_area", "h_n", "h_enhance", "h_prompt", "h_ratio"]
+        def _save_h3i(*values):
+            save_main_ui_state(dict(zip(h_save_keys, values)))
+        no_selection = gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+        h_refs_outputs = [h_ref_state, h_refs, h_file, h_selected_ref_idx, h_remove_selected]
+
+        def append_h_refs(new_files, current):
+            updated = list(current or [])
+            for p in extract_paths(new_files):
+                if p and p not in updated and len(updated) < H3I_MAX_REFS:
+                    updated.append(p)
+            return updated, ref_gallery_items(updated, tagged=True), None, None, no_selection
+
+        def on_h_selected(current, evt: gr.SelectData):
+            idx = evt.index
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(current or []):
+                return int(idx), gr.update(interactive=True, value=f"🗑️ Eliminar <Picture {int(idx) + 1}> ({Path(current[int(idx)]).name})")
+            return None, no_selection
+
+        def remove_h_ref(idx, current):
+            updated = list(current or [])
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(updated):
+                updated.pop(int(idx))
+            return updated, ref_gallery_items(updated, tagged=True), None, None, no_selection
+
+        h_file.upload(append_h_refs, inputs=[h_file, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_refs.upload(append_h_refs, inputs=[h_refs, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_refs.select(on_h_selected, inputs=[h_ref_state], outputs=[h_selected_ref_idx, h_remove_selected])
+        h_remove_selected.click(remove_h_ref, inputs=[h_selected_ref_idx, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_clear_refs.click(lambda: ([], [], None, None, no_selection), outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        for comp in (h_brief, h_aspect, h_options_count, h_writer_sees, h_area, h_n, h_enhance, h_prompt, h_ratio):
+            comp.change(_save_h3i, inputs=h_save_fields)
+
+        def run_h3i(*args):
+            options, analysis_json, status = h3i_generate(*args)
+            first = options[0]
+            save_main_ui_state({"h_options": options, "h_prompt": first["prompt"], "h_ratio": first["ratio"], "h_status": status})
+            return (options, gr.update(choices=h3i_option_choices(options), value=0), first["prompt"], first["ratio"], analysis_json, status)
+        h_generate.click(run_h3i,
+            inputs=[h_brief, h_ref_state, h_aspect, h_options_count, h_writer_sees,
+                    backend_sel, ollama_url, vision_model, writer_model, temperature_vision, temperature_writer, num_ctx, keep_alive],
+            outputs=[h_options_state, h_option_sel, h_prompt, h_ratio, h_analysis, h_status]).then(lambda: h3i_skill_status(), outputs=h_skill_info)
+
+        def pick_h_option(idx, options):
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(options or []):
+                return options[int(idx)]["prompt"], options[int(idx)]["ratio"]
+            return gr.update(), gr.update()
+        h_option_sel.input(pick_h_option, inputs=[h_option_sel, h_options_state], outputs=[h_prompt, h_ratio])
+
+        def run_h3i_render(*args):
+            paths, status = h3i_render(*args)
+            save_main_ui_state({"h_status": status})
+            return paths, status
+        h_render.click(run_h3i_render, inputs=[h_prompt, h_ratio, h_ref_state, h_area, h_n, h_enhance, h_brief, writer_model, vision_model],
+                       outputs=[h_gallery, h_status])
+        h_skill_update.click(lambda: f"{h3i_download_skill()} · {h3i_skill_status()}", outputs=h_skill_info)
 
     return app
 

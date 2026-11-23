@@ -23,3 +23,6 @@ custom_nodes/ComfyUI-H3PromptStudio/README.md
 # Workflows & API JSONs (local only)
 workflows/
 *.json
+
+# MiniMax-H3-Image skill, downloaded by the H3 Image tab (MiniMax-H3-Image Community License)
+skills/
