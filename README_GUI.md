@@ -35,10 +35,13 @@ Incluidos:
 
 - H3 Cinematic
 - H3 Dialogue
+- H3 Interaction
 - H3 Horror
 - H3 Action
+- H3 Fantasy (arte surrealista/fantástico; tolera prompts densos ou desordenados, como os do Prompt Transmuter)
 - Wan 2.x
 - LTX Video
+- LTX Video FLF
 
 El preset rellena estilo, cámara, prioridades de movimiento, audio y restricciones negativas. Todos los campos siguen siendo editables.
 
@@ -134,14 +137,25 @@ Para ajustes propios de cada máquina, crea `~/.config/h3ps/settings.json`. Lo l
 
 ## Director Mode
 
-La pestaña **Director Mode** permite introducir una escena de 20–60 segundos, opcionalmente una referencia visual, y dividirla automáticamente en planos cortos consecutivos. El proceso crea una **Continuity Bible**, un storyboard y un prompt H3 independiente para cada plano.
+La pestaña **Director Mode** permite introducir una escena de 20–180 segundos (planos objetivo de 5–30 s), opcionalmente varias imágenes de referencia con etiquetas de rol/nombre (`<Picture 1>`, `<Picture 2>`, ...), y dividirla automáticamente en planos cortos consecutivos. El proceso crea una **Continuity Bible**, un storyboard y un prompt H3 independiente para cada plano.
 
-El selector `Motion model` se utiliza como **Director/Planner model** en este modo. Puedes seleccionar cualquier modelo Ollama que tengas instalado; no se presupone un modelo concreto.
+El selector `Motion model` se utiliza como **Director/Planner model** en este modo. Puedes seleccionar cualquier modelo instalado en Ollama o llama.cpp; no se presupone un modelo concreto.
 
-Las salidas se guardan con **Save Director package** en `outputs/director_sequence.json` y `outputs/director_shots/`.
+Las salidas se guardan con **Save Director package** en `outputs/director_sequence.json`, `outputs/reference_library.json` y `outputs/director_shots/`, además de archivarse con marca temporal en `outputs/director_packages/package_<timestamp>/`.
 
 ## Plano-secuencia
 
 La pestaña **Plano-secuencia** escribe un prompt por segmento de una toma continua, para MiniMax H3 Ref y VideoConcat de SwarmUI. Usa los modelos Vision y Writer seleccionados en la pestaña principal y necesita al menos una imagen de referencia y dos duraciones.
 
 No hay conexión con SwarmUI: los resultados se pegan a mano. **Save prompts (txt)** los guarda en `outputs/plano_secuencia/`.
+
+## H3 Image
+
+La pestaña **H3 Image** escribe prompts para **MiniMax-H3-Image** (texto a imagen, o edición con hasta 16 imágenes de entrada) siguiendo el skill oficial [`h3-image-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills). Usa los modelos Vision y Writer de la pestaña principal.
+
+- El skill (SKILL.md, guías `t2i-en.txt`/`edit-en.txt` y su LICENSE) se descarga de GitHub en el primer uso a `skills/h3-image-prompt-writing/` (fuera de git, por la MiniMax-H3-Image Community License). **🔄 Update skill from GitHub** lo actualiza.
+- Sin imágenes es texto a imagen; con imágenes es edición y se citan como `<Picture 1>`, `<Picture 2>`… en el orden de subida. Por defecto el modelo Vision analiza cada imagen; si el Writer es multimodal, marca **Send the images to the Writer** para que las vea directamente.
+- **Aspect ratio** `Auto` deja que el Writer lo elija (entre 1:3 y 3:1); **Options** pide hasta 3 variantes.
+- **Render with the MiniMax API** (opcional) necesita `MINIMAX_API_KEY` en el entorno, o `minimax_api_key` en `~/.config/h3ps/settings.json` (`MINIMAX_API_BASE` / `minimax_api_base` para la plataforma China). Las imágenes se guardan en `outputs/h3_image/` como PNG con el prompt y la petición completa en los metadatos (`prompt`, `workflow`) y un `.json` al lado.
+
+Powered by MiniMax-H3-Image.

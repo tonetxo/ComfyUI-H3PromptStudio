@@ -2,7 +2,9 @@
 import argparse
 import base64
 import hashlib
+import io
 import json
+import logging
 import math
 import os
 import random
@@ -10,13 +12,55 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import gradio as gr
 import requests
 from PIL import Image
+
+logger = logging.getLogger("H3PromptStudio")
+_FILE_LOCK = threading.RLock()
+_RESCAN_LOCK = threading.Lock()
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+_BLOCKED_SCHEMES = ("file:", "ftp:", "javascript:", "data:", "gopher:")
+
+
+def sanitize_url(url: Any, default: str = "http://127.0.0.1:11434") -> str:
+    """Ensure URL has a safe http/https scheme and fallback to default when empty."""
+    u = str(url or "").strip()
+    if not u:
+        u = default
+    if "://" not in u:
+        if u.lower().startswith(_BLOCKED_SCHEMES):
+            raise ValueError(f"[H3 Prompt Studio] Invalid URL '{url}': only http/https URLs are allowed.")
+        u = "http://" + u
+    parsed = urllib.parse.urlparse(u)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"[H3 Prompt Studio] Invalid URL '{url}': only http/https URLs are allowed.")
+    return u.rstrip("/")
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -38,7 +82,7 @@ DEFAULT_CONFIG = {
 }
 
 MODES = ["T2VA", "I2VA", "FLF2VA", "L2VA", "R2V"]
-PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Interaction", "H3 Horror", "H3 Action", "Wan 2.x", "LTX Video", "LTX Video FLF"]
+PRESETS = ["H3 Cinematic", "H3 Dialogue", "H3 Interaction", "H3 Horror", "H3 Action", "H3 Fantasy", "Wan 2.x", "LTX Video", "LTX Video FLF"]
 DIRECTOR_TOTALS = ["20","24","30","36","40","45","48","50","54","60","75","90","120","150","180"]
 DIRECTOR_SHOTS = ["5","6","8","10","12","15","18","20","25","30"]
 # Director form values stored with each sequence, so a loaded package can be rebuilt as it was made.
@@ -81,6 +125,13 @@ PRESETS_DATA = {
         "motion": "Strong, continuous primary and secondary motion: body momentum, debris, dust, smoke, water, fabric, recoil, vibration and environmental reactions. Every impact should have visible consequences.",
         "audio": "Diegetic action audio tightly tied to visible events: impacts, machinery, footsteps, debris, alarms, pressure, wind, water. No music unless requested.",
         "negative": "Weightless movement; instant position changes; impossible inertia; frozen debris; frozen atmosphere; camera teleportation; duplicated bodies; random explosions; unwanted music/dialogue.",
+    },
+    "H3 Fantasy": {
+        "style": "surreal fantasy art brought to life as a living painting; keep the exact artistic references, materials and palette named in the scene (e.g. glazed ceramic mosaics, melting forms, impossible geometry) and render them consistently in every frame. The scene text may be dense, poetic or scrambled word salad: read it as a description of a single still artwork, extract its concrete anchors (main structures, landscape layers, water, sky, light direction, colors, materials, named artists and style percentages) and rebuild them into clear, grammatical spatial description; drop fragments that make no sense instead of inventing new subjects",
+        "camera": "slow majestic establishing movement that reveals the whole composition: gentle aerial drift, slow push-in or a wide arc around the main structure; keep the horizon, scale and layout of the artwork stable; no cuts",
+        "motion": "The artwork stays recognizable while it comes alive: clouds drift and billow, waterfalls pour and foam, rivers flow along their curves, mist and haze breathe across the valley, light shifts slowly across glazed surfaces with moving specular highlights, banners and foliage sway. Surreal elements move in their own logic: soft forms melt and re-form slowly, impossible staircases and geometries keep a consistent paradoxical structure instead of collapsing. Architecture stays solid unless the scene asks it to melt.",
+        "audio": "Atmospheric diegetic ambience of the place: rushing waterfalls, flowing river, wind over cliffs, distant birds, faint chimes or bells only if visible sources exist. No music unless requested.",
+        "negative": "Photorealistic reinterpretation that loses the painted or ceramic style; style drift between frames; structures collapsing or warping randomly; flickering mosaic patterns; frozen water or clouds; random new buildings or characters; legible text or lettering; watermarks; camera cuts; chaotic fast motion.",
     },
     "Wan 2.x": {
         "style": "photorealistic generative video, strong temporal consistency, clear subject silhouettes, robust motion readability",
@@ -204,61 +255,77 @@ EVOLVE_SYNONYMS = {
 _WORD_RE = re.compile(r"[a-zA-Z]+")
 
 
-def _evolve_replace(token: str, strength: int, repl: str) -> str:
-    if not _WORD_RE.fullmatch(token) or random.random() * 100 >= strength:
-        return token
-    if token[0].isupper():
+def _match_case(token: str, repl: str) -> str:
+    if token.isupper() and len(token) > 1:
+        return repl.upper()
+    if token and token[0].isupper():
         return repl.capitalize()
     return repl
 
 
-def evolve_words(prompt: str, strength: int) -> str:
+def _evolve_replace(
+    token: str,
+    strength: int,
+    repl: str,
+    rng: Optional[random.Random] = None,
+) -> str:
+    r = rng if rng is not None else random
+    if not _WORD_RE.fullmatch(token) or r.random() * 100 >= strength:
+        return token
+    return _match_case(token, repl)
+
+
+def evolve_words(prompt: str, strength: int, rng: Optional[random.Random] = None) -> str:
+    r = rng if rng is not None else random
     parts = re.split(r"(\b)", prompt)
     return "".join(
-        _evolve_replace(p, strength, random.choice(EVOLVE_VOCAB))
+        _evolve_replace(p, strength, r.choice(EVOLVE_VOCAB), rng=r)
         if _WORD_RE.fullmatch(p) else p
         for p in parts
     )
 
 
-def evolve_internal(prompt: str, strength: int) -> str:
+def evolve_internal(prompt: str, strength: int, rng: Optional[random.Random] = None) -> str:
+    r = rng if rng is not None else random
     raw_words = _WORD_RE.findall(prompt)
     if len(raw_words) < 2:
         return prompt
     parts = re.split(r"(\b)", prompt)
     return "".join(
-        _evolve_replace(p, strength, random.choice(raw_words))
+        _evolve_replace(p, strength, r.choice(raw_words), rng=r)
         if _WORD_RE.fullmatch(p) else p
         for p in parts
     )
 
 
-def evolve_synonyms(prompt: str, strength: int) -> str:
+def evolve_synonyms(prompt: str, strength: int, rng: Optional[random.Random] = None) -> str:
+    r = rng if rng is not None else random
     parts = re.split(r"(\b)", prompt)
     out = []
     for p in parts:
-        lower = p.lower()
-        syns = EVOLVE_SYNONYMS.get(lower)
-        if not syns or random.random() * 100 >= strength:
+        syns = EVOLVE_SYNONYMS.get(p.lower())
+        if not syns:
             out.append(p)
         else:
-            out.append(_evolve_replace(p, strength, random.choice(syns)))
+            out.append(_evolve_replace(p, strength, r.choice(syns), rng=r))
     return "".join(out)
 
 
 def generate_evolved(prompt: str, mode: str, strength: int, count: int, seed: int) -> str:
-    if not prompt.strip():
+    cleaned = prompt.strip()
+    if not cleaned:
         return ""
-    base_seed = hash((int(seed), mode, prompt.strip()))
+    digest = hashlib.sha256(f"{int(seed)}:{mode}:{cleaned}".encode("utf-8")).digest()
+    base_seed = int.from_bytes(digest[:8], "big")
     variants = []
     for i in range(int(count)):
-        random.seed(base_seed + i)
+        rng = random.Random(base_seed + i)
         if mode == "words":
-            v = evolve_words(prompt, strength)
+            v = evolve_words(prompt, strength, rng=rng)
         elif mode == "internal":
-            v = evolve_internal(prompt, strength)
+            v = evolve_internal(prompt, strength, rng=rng)
         else:
-            v = evolve_synonyms(prompt, strength)
+            v = evolve_synonyms(prompt, strength, rng=rng)
         variants.append(" ".join(v.split()))
     return "\n\n".join(f"--- Variant {i + 1} ---\n{v}" for i, v in enumerate(variants))
 
@@ -404,17 +471,23 @@ def is_minimax_enhancer(model_name: str) -> bool:
 
 
 def load_config() -> Dict[str, Any]:
-    data = {}
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    data: Dict[str, Any] = {}
+    with _FILE_LOCK:
+        if CONFIG_PATH.exists():
+            try:
+                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+                else:
+                    logger.warning("config.json ignored because root is %s instead of dict", type(loaded).__name__)
+            except Exception as e:
+                logger.warning("Failed to parse config.json, using defaults: %s", e)
     return {**DEFAULT_CONFIG, **data}
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    with _FILE_LOCK:
+        _atomic_write_text(CONFIG_PATH, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
 LOCAL_SETTINGS_PATH = Path.home() / ".config" / "h3ps" / "settings.json"
@@ -440,7 +513,8 @@ def _scan_gguf_models() -> list[str]:
 
 def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
     if backend == "llamacpp":
-        r = requests.get(url.rstrip("/") + "/v1/models", timeout=5)
+        base_url = sanitize_url(url, default="http://127.0.0.1:8080")
+        r = requests.get(base_url + "/v1/models", timeout=5)
         r.raise_for_status()
         models = [m.get("id", "").strip() for m in r.json().get("data", [])]
         # Downloaded GGUFs stay selectable even if the server does not list them yet.
@@ -448,7 +522,8 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
             if m not in models:
                 models.append(m)
         return sorted([m for m in models if m])
-    r = requests.get(url.rstrip("/") + "/api/tags", timeout=5)
+    base_url = sanitize_url(url, default="http://127.0.0.1:11434")
+    r = requests.get(base_url + "/api/tags", timeout=5)
     r.raise_for_status()
     models = [m.get("name", "").strip() for m in r.json().get("models", [])]
     return sorted([m for m in models if m])
@@ -456,28 +531,34 @@ def get_ollama_models(url: str, backend: str = "ollama") -> list[str]:
 
 def rescan_llamacpp_models(url: str) -> str:
     """Run the optional llamacpp_rescan_command setting, then report what the server lists."""
-    command = (load_local_settings().get("llamacpp_rescan_command") or "").strip()
-    if command:
-        try:
-            subprocess.run([os.path.expanduser(arg) for arg in shlex.split(command)], check=True, timeout=180)
-        except subprocess.CalledProcessError as e:
-            return f"Rescan failed: {e}"
-        except Exception as e:
-            return f"Rescan error: {e}"
-
-    # A command may have restarted the server, so give it time to come back up.
-    models_url = url.rstrip("/") + "/v1/models"
-    for _ in range(40 if command else 1):
-        try:
-            r = requests.get(models_url, timeout=2)
-            if r.ok:
-                ids = [m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()]
-                return f"llama.cpp OK — {len(ids)} model(s): {', '.join(ids)}"
-        except Exception:
-            pass
+    base_url = sanitize_url(url, default="http://127.0.0.1:8080")
+    if not _RESCAN_LOCK.acquire(blocking=False):
+        return "Rescan already in progress."
+    try:
+        command = (load_local_settings().get("llamacpp_rescan_command") or "").strip()
         if command:
-            time.sleep(0.5)
-    return f"llama.cpp did not respond at {url}"
+            try:
+                subprocess.run([os.path.expanduser(arg) for arg in shlex.split(command)], check=True, timeout=180)
+            except subprocess.CalledProcessError as e:
+                return f"Rescan failed: {e}"
+            except Exception as e:
+                return f"Rescan error: {e}"
+
+        # A command may have restarted the server, so give it time to come back up.
+        models_url = base_url + "/v1/models"
+        for _ in range(40 if command else 1):
+            try:
+                r = requests.get(models_url, timeout=2)
+                if r.ok:
+                    ids = [m.get("id", "").strip() for m in r.json().get("data", []) if m.get("id", "").strip()]
+                    return f"llama.cpp OK — {len(ids)} model(s): {', '.join(ids)}"
+            except Exception:
+                pass
+            if command:
+                time.sleep(0.5)
+        return f"llama.cpp did not respond at {base_url}"
+    finally:
+        _RESCAN_LOCK.release()
 
 
 def check_ollama(url: str, backend: str = "ollama") -> str:
@@ -510,16 +591,43 @@ def refresh_ollama_models(url: str, current_vision: str = "", current_writer: st
                 f"{'llama.cpp' if backend == 'llamacpp' else 'Ollama'} unavailable: {e}")
 
 
+VISION_MAX_SIDE = 2048
+VISION_JPEG_QUALITY = 90
+
+
 def image_to_b64(path: str) -> str:
-    return base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    """Encode an image for vision models as a bounded-size RGB JPEG.
+
+    Raw uploads (large PNG/WebP, alpha, EXIF rotation) break some backends:
+    cloud models cap media at 10 MB and the llama.cpp path labels data as JPEG.
+    """
+    try:
+        from PIL import ImageOps
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGBA")
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.getchannel("A"))
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            img.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=VISION_JPEG_QUALITY)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.warning("Failed to encode image %s: %s", path, e)
+        raise ValueError(f"Imagen inválida o no legible ({path}): {e}") from e
 
 
 def ollama_model_info(url: str, model: str) -> Dict[str, Any]:
     """Return /api/show information when available. Never fail generation just because metadata is unavailable."""
     if not model:
         return {}
+    base_url = sanitize_url(url, default="http://127.0.0.1:11434")
     try:
-        r = requests.post(url.rstrip("/") + "/api/show", json={"name": model}, timeout=15)
+        r = requests.post(base_url + "/api/show", json={"name": model}, timeout=15)
         if r.ok:
             return r.json()
     except requests.RequestException:
@@ -606,11 +714,12 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
     }
     if stop:
         payload["stop"] = [s for s in stop if s != "</s>"]
+    base_url = sanitize_url(cfg.get("ollama_url"), default="http://127.0.0.1:8080")
     t0 = time.perf_counter()
     try:
-        r = requests.post(cfg["ollama_url"].rstrip("/") + "/v1/chat/completions", json=payload, timeout=900)
+        r = requests.post(base_url + "/v1/chat/completions", json=payload, timeout=900)
     except requests.RequestException as e:
-        raise RuntimeError(f"No se pudo conectar con llama.cpp ({cfg['ollama_url']}): {e}") from e
+        raise RuntimeError(f"No se pudo conectar con llama.cpp ({base_url}): {e}") from e
     elapsed = time.perf_counter() - t0
     if not r.ok:
         try:
@@ -621,22 +730,36 @@ def llamacpp_chat_completion(cfg: Dict[str, Any], model: str, messages: list, te
     try:
         data = r.json()
         if track_stats is not None and isinstance(track_stats, list):
-            usage = data.get("usage", {})
-            eval_cnt = usage.get("completion_tokens", 0)
-            tok_s = round(eval_cnt / elapsed, 1) if elapsed and eval_cnt else 0
+            usage = data.get("usage", {}) or {}
+            timings = data.get("timings") if isinstance(data.get("timings"), dict) else {}
+            eval_cnt = usage.get("completion_tokens") or timings.get("predicted_n") or 0
+            pred_ms = timings.get("predicted_ms")
+            eval_dur_s = round(float(pred_ms) / 1000.0, 2) if isinstance(pred_ms, (int, float)) and pred_ms > 0 else round(elapsed, 2)
+            pred_tps = timings.get("predicted_per_second")
+            if isinstance(pred_tps, (int, float)) and pred_tps > 0:
+                tok_s = round(float(pred_tps), 1)
+            elif eval_dur_s and eval_cnt:
+                tok_s = round(eval_cnt / eval_dur_s, 1)
+            else:
+                tok_s = 0
             track_stats.append({
                 "model": model,
                 "elapsed_s": round(elapsed, 2),
                 "eval_count": eval_cnt,
-                "eval_duration_s": round(elapsed, 2),
+                "eval_duration_s": eval_dur_s,
                 "tokens_per_second": tok_s,
                 "total_duration_s": round(elapsed, 2),
                 "load_duration_s": 0.0,
-                "prompt_eval_count": usage.get("prompt_tokens", 0),
+                "prompt_eval_count": usage.get("prompt_tokens") or timings.get("prompt_n") or 0,
             })
         return data["choices"][0]["message"].get("content", "") or ""
     except (ValueError, KeyError, TypeError) as e:
         raise RuntimeError(f"Respuesta inesperada de llama.cpp para '{model}': {r.text[:1000]}") from e
+
+
+def director_plan_max_tokens(shot_count: int) -> int:
+    """Token budget for the Director plan JSON: ~350 tokens per shot plus the continuity bible."""
+    return max(4096, int(shot_count) * 350 + 1500)
 
 
 def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: float, track_stats: Optional[list] = None, max_tokens: Optional[int] = None) -> str:
@@ -644,6 +767,7 @@ def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: fl
         raise ValueError("No model selected.")
     if cfg.get("backend") == "llamacpp":
         return llamacpp_chat_completion(cfg, model, messages, temperature, track_stats, max_tokens=max_tokens)
+    base_url = sanitize_url(cfg.get("ollama_url"), default="http://127.0.0.1:11434")
     payload = {
         "model": model,
         "messages": messages,
@@ -653,9 +777,9 @@ def ollama_chat(cfg: Dict[str, Any], model: str, messages: list, temperature: fl
     }
     t0 = time.perf_counter()
     try:
-        r = requests.post(cfg["ollama_url"].rstrip("/") + "/api/chat", json=payload, timeout=900)
+        r = requests.post(base_url + "/api/chat", json=payload, timeout=900)
     except requests.RequestException as e:
-        raise RuntimeError(f"No se pudo conectar con Ollama ({cfg['ollama_url']}): {e}") from e
+        raise RuntimeError(f"No se pudo conectar con Ollama ({base_url}): {e}") from e
     elapsed = time.perf_counter() - t0
     if not r.ok:
         raise RuntimeError(format_ollama_http_error(r, model))
@@ -724,11 +848,12 @@ def ollama_generate_raw(cfg: Dict[str, Any], model: str, prompt: str, temperatur
         },
         "keep_alive": cfg["keep_alive"],
     }
+    base_url = sanitize_url(cfg.get("ollama_url"), default="http://127.0.0.1:11434")
     t0 = time.perf_counter()
     try:
-        r = requests.post(cfg["ollama_url"].rstrip("/") + "/api/generate", json=payload, timeout=900)
+        r = requests.post(base_url + "/api/generate", json=payload, timeout=900)
     except requests.RequestException as e:
-        raise RuntimeError(f"No se pudo conectar con Ollama ({cfg['ollama_url']}): {e}") from e
+        raise RuntimeError(f"No se pudo conectar con Ollama ({base_url}): {e}") from e
     elapsed = time.perf_counter() - t0
     if not r.ok:
         raise RuntimeError(format_ollama_http_error(r, model))
@@ -980,25 +1105,36 @@ def analysis_to_enhancer_assets(analysis: Optional[Dict[str, Any]], mode: str) -
     return ["(none)"]
 
 
+def _as_list(val: Any) -> list[str]:
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if x is not None and str(x).strip()]
+    if isinstance(val, dict):
+        return [str(v).strip() for v in val.values() if v is not None and str(v).strip()]
+    if isinstance(val, str):
+        return [val.strip()] if val.strip() else []
+    return [str(val).strip()] if val else []
+
+
 def _motion_plan_to_text(motion_plan: Optional[Dict[str, Any]]) -> str:
     """Convert Motion Director JSON into a short prose context block."""
     if not motion_plan or not isinstance(motion_plan, dict):
         return ""
     parts = []
-    if motion_plan.get("primary_actions"):
-        parts.append("Primary actions: " + " ".join(str(a) for a in motion_plan["primary_actions"] if a))
-    if motion_plan.get("camera_motion"):
-        cm = motion_plan["camera_motion"]
-        if isinstance(cm, dict):
-            parts.append("Camera: " + " ".join(str(v) for v in cm.values() if v))
-        else:
-            parts.append("Camera: " + str(cm))
-    if motion_plan.get("timing_beats"):
-        parts.append("Timing: " + " ".join(str(b) for b in motion_plan["timing_beats"] if b))
-    if motion_plan.get("motion_constraints"):
-        parts.append("Constraints: " + " ".join(str(c) for c in motion_plan["motion_constraints"] if c))
-    if motion_plan.get("audio_events"):
-        parts.append("Audio events: " + " ".join(str(e) for e in motion_plan["audio_events"] if e))
+    pa = _as_list(motion_plan.get("primary_actions"))
+    if pa:
+        parts.append("Primary actions: " + " ".join(pa))
+    cm = _as_list(motion_plan.get("camera_motion"))
+    if cm:
+        parts.append("Camera: " + " ".join(cm))
+    tb = _as_list(motion_plan.get("timing_beats"))
+    if tb:
+        parts.append("Timing: " + " ".join(tb))
+    mc = _as_list(motion_plan.get("motion_constraints"))
+    if mc:
+        parts.append("Constraints: " + " ".join(mc))
+    ae = _as_list(motion_plan.get("audio_events"))
+    if ae:
+        parts.append("Audio events: " + " ".join(ae))
     return "\n".join(parts).strip()
 
 
@@ -1061,6 +1197,10 @@ def build_enhancer_user_prompt(
     return system, "\n".join(user_parts)
 
 
+def _strip_chatml_tokens(text: str) -> str:
+    return text.replace("<|im_start|>", "").replace("<|im_end|>", "").replace("<|endoftext|>", "")
+
+
 def generate_enhanced_prompt(
     cfg: Dict[str, Any],
     mode: str,
@@ -1072,18 +1212,33 @@ def generate_enhanced_prompt(
     r2v_task: str,
     track_stats: Optional[list] = None,
 ) -> str:
-    """Call the MiniMax Prompt Enhancer using its official contract via raw generate.
+    """Call the MiniMax Prompt Enhancer using its official contract.
 
-    We bypass Ollama's chat template because the enhancer's GGUF embeds a template that
-    forces a thinking block. A hand-built ChatML string sent to /api/generate gives the
-    direct structured output the model was fine-tuned to produce.
+    On Ollama we bypass the chat template via raw generate with an explicit ChatML string
+    to avoid forcing a thinking block. On llamacpp the router applies its own template and
+    supports chat_template_kwargs, so we send structured messages directly.
     """
     system, user_prompt = build_enhancer_user_prompt(
         mode, duration, scene, analysis, motion_plan, audio_notes, r2v_task
     )
+    if cfg.get("backend") == "llamacpp":
+        messages = []
+        if system.strip():
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user_prompt})
+        raw = llamacpp_chat_completion(
+            cfg,
+            cfg["writer_model"],
+            messages,
+            float(cfg["temperature_writer"]),
+            track_stats=track_stats,
+        )
+        return clean_enhancer_output(raw)
+    safe_system = _strip_chatml_tokens(system)
+    safe_user = _strip_chatml_tokens(user_prompt)
     chatml_prompt = (
-        f"<|im_start|>system\n{system}<|im_end|>\n"
-        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"<|im_start|>system\n{safe_system}<|im_end|>\n"
+        f"<|im_start|>user\n{safe_user}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
     raw = ollama_generate_raw(
@@ -1123,12 +1278,10 @@ def clean_enhancer_output(text: str) -> str:
         "How the reference pictures align",
     )
     last_idx = -1
-    chosen_header = ""
     for header in valid_headers:
         idx = cleaned.lower().rfind(header.lower())
         if idx > last_idx:
             last_idx = idx
-            chosen_header = header
     if last_idx == -1:
         # No valid header found; the whole thing is likely reasoning.
         return ""
@@ -1170,35 +1323,29 @@ def is_enhancer_output_valid(mode: str, text: str) -> bool:
     return t.startswith("integrated_multimodal_description:") or t.startswith("for the target video") or t.startswith("how the reference pictures align")
 
 
-def ollama_unload_model(url: str, model: str) -> None:
-    if not model:
+def ollama_unload_model(url: str, model: str, backend: str = "ollama") -> None:
+    if not model or backend == "llamacpp":
         return
+    clean_url = sanitize_url(url, default="http://127.0.0.1:11434")
     try:
-        clean_url = url.rstrip("/") if url else "http://127.0.0.1:11434"
         requests.post(f"{clean_url}/api/generate", json={"model": model, "keep_alive": 0}, timeout=5)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to unload Ollama model %s: %s", model, e)
 
 
-def ollama_unload_all(url: str) -> None:
+def ollama_unload_all(url: str, backend: str = "ollama") -> None:
+    if backend == "llamacpp":
+        return
+    clean_url = sanitize_url(url, default="http://127.0.0.1:11434")
     try:
-        clean_url = url.rstrip("/") if url else "http://127.0.0.1:11434"
         r = requests.get(f"{clean_url}/api/ps", timeout=5)
         if r.ok:
             for m in r.json().get("models", []):
                 name = m.get("name") or m.get("model")
                 if name:
-                    ollama_unload_model(clean_url, name)
-    except Exception:
-        pass
-
-
-def analyze_image(cfg: Dict[str, Any], image_path: str) -> Dict[str, Any]:
-    messages = [
-        {"role": "system", "content": VISION_SYSTEM},
-        {"role": "user", "content": "Analyze this reference image. Return JSON only.", "images": [image_to_b64(image_path)]},
-    ]
-    return extract_json(ollama_chat(cfg, cfg["vision_model"], messages, float(cfg["temperature_vision"])))
+                    ollama_unload_model(clean_url, name, backend=backend)
+    except Exception as e:
+        logger.warning("Failed to unload Ollama models at %s: %s", clean_url, e)
 
 
 def analyze_visual_inputs(cfg: Dict[str, Any], images_dict: Optional[Dict[str, Any]], track_stats: Optional[list] = None) -> Optional[Dict[str, Any]]:
@@ -1290,7 +1437,11 @@ def analyze_visual_inputs(cfg: Dict[str, Any], images_dict: Optional[Dict[str, A
 
     finally:
         if cfg.get("keep_alive") == "0m":
-            ollama_unload_model(cfg.get("ollama_url", "http://127.0.0.1:11434"), v_model)
+            ollama_unload_model(
+                cfg.get("ollama_url", "http://127.0.0.1:11434"),
+                v_model,
+                backend=cfg.get("backend", "ollama"),
+            )
 
     return None
 
@@ -1430,42 +1581,29 @@ def generate_prompt(cfg: Dict[str, Any], writer_prompt: str, track_stats: Option
 
 
 def load_history() -> list[dict]:
-    if not HISTORY_PATH.exists():
-        return []
-    try:
-        return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    with _FILE_LOCK:
+        if not HISTORY_PATH.exists():
+            return []
+        try:
+            data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+            logger.warning("prompt_history.json ignored because root is %s instead of list", type(data).__name__)
+        except Exception as e:
+            logger.warning("Failed to parse prompt_history.json: %s", e)
         return []
 
 
 def save_history(items: list[dict]) -> None:
-    HISTORY_PATH.write_text(json.dumps(items[-100:], indent=2, ensure_ascii=False), encoding="utf-8")
+    with _FILE_LOCK:
+        _atomic_write_text(HISTORY_PATH, json.dumps(items[-100:], indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
 # UI state persistence
 # ---------------------------------------------------------------------------
 
-UI_STATE_FIELDS = [
-    "mode", "duration", "aspect",
-    "single_image", "flf_first", "flf_last",
-    "r2v_state", "r2v_video_enabled", "r2v_video_file", "r2v_video_notes", "r2v_task",
-    "scene", "preset", "style", "camera", "motion", "audio", "dialogue", "constraints", "negative",
-    "motion_enabled", "title",
-    "backend", "ollama_url", "vision_model", "motion_model", "writer_model",
-    "temperature_vision", "temperature_motion", "temperature_writer", "num_ctx", "keep_alive",
-    "analysis", "motion_plan", "prompt", "timing_display",
-    "evolve_mode", "evolve_strength", "evolve_count", "evolve_seed",
-]
-
-DIRECTOR_UI_STATE_FIELDS = [
-    "d_scene", "d_ref_state", "d_ref_labels",
-    "d_mode", "d_total", "d_shot", "d_preset",
-    "d_style", "d_camera", "d_motion", "d_audio", "d_dialogue", "d_constraints",
-    "director_state", "d_bible", "d_storyboard", "d_prompts", "d_status", "d_timing_display",
-]
-
-
+_MAX_MEMORY_CACHE = 128
 _PERSISTED_REFS: Dict[str, str] = {}
 
 
@@ -1496,9 +1634,12 @@ def _copy_ref_to_persistent(path: Optional[str], subdir: str) -> Optional[str]:
         dest = dest_dir / f"{digest}_{src.name}"
         if not dest.exists():
             shutil.copy2(src, dest)
+        if len(_PERSISTED_REFS) >= _MAX_MEMORY_CACHE:
+            del _PERSISTED_REFS[next(iter(_PERSISTED_REFS))]
         _PERSISTED_REFS[str(src)] = str(dest)
         return str(dest)
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to copy reference %s to persistent storage: %s", src, e)
         return str(path)
 
 
@@ -1519,48 +1660,45 @@ def _persist_refs(state: Dict[str, Any]) -> Dict[str, Any]:
     o_refs = out.get("o_ref_state")
     if isinstance(o_refs, list):
         out["o_ref_state"] = [_copy_ref_to_persistent(p, "oner") for p in o_refs]
+    h_refs = out.get("h_ref_state")
+    if isinstance(h_refs, list):
+        out["h_ref_state"] = [_copy_ref_to_persistent(p, "h3_image") for p in h_refs]
     return out
 
 
 def load_ui_state() -> Dict[str, Any]:
-    if not UI_STATE_PATH.exists():
+    with _FILE_LOCK:
+        if not UI_STATE_PATH.exists():
+            return {}
+        try:
+            data = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+            logger.warning("ui_state.json ignored because root is %s instead of dict", type(data).__name__)
+        except Exception as e:
+            logger.warning("Failed to parse ui_state.json: %s", e)
         return {}
-    try:
-        data = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
 
 
 def save_ui_state(state: Dict[str, Any]) -> None:
-    try:
-        UI_STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def clear_ui_state() -> None:
-    if UI_STATE_PATH.exists():
+    with _FILE_LOCK:
         try:
-            UI_STATE_PATH.unlink()
-        except Exception:
-            pass
+            _atomic_write_text(UI_STATE_PATH, json.dumps(state, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("Failed to save ui_state.json: %s", e)
 
 
 def save_main_ui_state(values: Dict[str, Any]) -> None:
-    """Persist the main tab UI state. Transient image paths are copied first."""
-    state = load_ui_state()
-    state.update(_persist_refs(values))
-    save_ui_state(state)
+    """Persist tab UI state. Transient image paths are copied first."""
+    with _FILE_LOCK:
+        state = load_ui_state()
+        state.update(_persist_refs(values))
+        save_ui_state(state)
 
 
 def save_director_ui_state(values: Dict[str, Any]) -> None:
-    """Persist the Director Mode tab UI state."""
-    state = load_ui_state()
-    state.update(_persist_refs(values))
-    save_ui_state(state)
+    """Persist the Director/Oner Mode tab UI state."""
+    save_main_ui_state(values)
 
 
 def history_choices(items: list[dict]) -> list[str]:
@@ -1609,11 +1747,19 @@ def format_timing_badge(timings: Dict[str, Any], enhancer_fallback: bool = False
 
 
 def add_history(title: str, payload: dict) -> tuple[list[dict], str]:
-    items = load_history()
-    item = {"id": time.strftime("%Y%m%d-%H%M%S"), "title": title.strip() or "Untitled", "created": time.strftime("%Y-%m-%d %H:%M:%S"), **payload}
-    items.append(item)
-    save_history(items)
-    return items, item["id"]
+    with _FILE_LOCK:
+        items = load_history()
+        existing_ids = {i.get("id") for i in items if isinstance(i, dict)}
+        base_id = time.strftime("%Y%m%d-%H%M%S")
+        hid = base_id
+        suffix = 2
+        while hid in existing_ids:
+            hid = f"{base_id}-{suffix}"
+            suffix += 1
+        item = {"id": hid, "title": title.strip() or "Untitled", "created": time.strftime("%Y-%m-%d %H:%M:%S"), **payload}
+        items.append(item)
+        save_history(items)
+        return items, hid
 
 
 def get_history_item(choice: str) -> Optional[dict]:
@@ -1734,7 +1880,7 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
     items, hid = add_history(title, record)
 
     if keep_alive == "0m":
-        ollama_unload_all(cfg["ollama_url"])
+        ollama_unload_all(cfg["ollama_url"], backend=cfg.get("backend", "ollama"))
 
     timing_md = format_timing_badge(timings, enhancer_fallback=(is_minimax_enhancer(writer_model) and not enhancer_used))
 
@@ -1747,7 +1893,7 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
         "scene": scene, "preset": preset, "style": style, "camera": camera,
         "motion": motion, "audio": audio, "dialogue": dialogue, "constraints": constraints,
         "negative": negative, "motion_enabled": motion_enabled, "title": title,
-        "ollama_url": ollama_url, "vision_model": vision_model, "motion_model": motion_model,
+        "backend": backend, "ollama_url": ollama_url, "vision_model": vision_model, "motion_model": motion_model,
         "writer_model": writer_model,
         "temperature_vision": temperature_vision, "temperature_motion": temperature_motion,
         "temperature_writer": temperature_writer, "num_ctx": num_ctx, "keep_alive": keep_alive,
@@ -1765,12 +1911,29 @@ def do_generate(single_image, flf_first, flf_last, r2v_state, r2v_video_enabled,
 def restore_history(choice):
     item = get_history_item(choice)
     if not item:
-        return ("", "", "", "I2VA", "10s", "16:9", "H3 Cinematic", "", "", "", "", "", "", False, "", "", "⏱️ **Tiempos de ejecución:** *(Sin datos)*")
+        return ("", "", "", "I2VA", "10s", "16:9", "H3 Cinematic", "", "", "", "", "", "", "", False, "", "", "⏱️ **Tiempos de ejecución:** *(Sin datos)*")
     timing_md = format_timing_badge(item.get("timings", {}))
-    return (item.get("scene", ""), item.get("prompt", ""), json.dumps(item.get("analysis"), indent=2, ensure_ascii=False) if item.get("analysis") else "No reference image.",
-            item.get("mode", "I2VA"), item.get("duration", "10s"), item.get("aspect", "16:9"), item.get("preset", "H3 Cinematic"),
-            item.get("style", ""), item.get("camera", ""), item.get("motion", ""), item.get("audio", ""), item.get("dialogue", ""),
-            item.get("constraints", ""), False, item.get("motion_plan") and json.dumps(item.get("motion_plan"), indent=2, ensure_ascii=False) or "", item.get("title", ""), timing_md)
+    mp = item.get("motion_plan")
+    return (
+        item.get("scene", ""),
+        item.get("prompt", ""),
+        json.dumps(item.get("analysis"), indent=2, ensure_ascii=False) if item.get("analysis") else "No reference image.",
+        item.get("mode", "I2VA"),
+        item.get("duration", "10s"),
+        item.get("aspect", "16:9"),
+        item.get("preset", "H3 Cinematic"),
+        item.get("style", ""),
+        item.get("camera", ""),
+        item.get("motion", ""),
+        item.get("audio", ""),
+        item.get("dialogue", ""),
+        item.get("constraints", ""),
+        item.get("negative", ""),
+        bool(mp),
+        json.dumps(mp, indent=2, ensure_ascii=False) if mp else "",
+        item.get("title", ""),
+        timing_md,
+    )
 
 
 def compare_history(a, b):
@@ -2104,6 +2267,8 @@ def image_size_text(path: Any) -> str:
             width, height = img.size
     except (OSError, ValueError, TypeError, AttributeError):
         return ""
+    if width <= 0 or height <= 0:
+        return ""
     divisor = math.gcd(width, height) or 1
     w, h = width // divisor, height // divisor
     # An exact ratio like 427:240 says nothing at a glance, so large terms become a decimal.
@@ -2251,15 +2416,17 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     raw_plan = ollama_chat(cfg, director_model, [
         {"role":"system","content":DIRECTOR_SYSTEM},
         {"role":"user","content":json.dumps(planner_input, ensure_ascii=False, indent=2)}
-    ], td, track_stats=stats_log, max_tokens=4096)
+    ], td, track_stats=stats_log, max_tokens=director_plan_max_tokens(count))
     t_director = time.perf_counter() - t_d_start
 
     plan = extract_json(raw_plan)
-    shots = plan.get("shots", [])
+    raw_shots = plan.get("shots", [])
+    shots = [s for s in raw_shots if isinstance(s, dict)] if isinstance(raw_shots, list) else []
     if not shots:
         print(f"[Director] Error: No shots parsed. Raw output (len={len(raw_plan)}):\n{raw_plan[:800]}")
         raise ValueError("Director model no devolvió ningún plano.")
-    bible = plan.get("continuity_bible", {})
+    raw_bible = plan.get("continuity_bible", {})
+    bible = raw_bible if isinstance(raw_bible, dict) else {}
     timeline = 0
     prompts = []
     t_w_start = time.perf_counter()
@@ -2314,7 +2481,7 @@ def director_generate(scene, mode, reference_files, reference_labels, total_dura
     }
 
     if keep_alive == "0m":
-        ollama_unload_all(cfg["ollama_url"])
+        ollama_unload_all(cfg["ollama_url"], backend=cfg.get("backend", "ollama"))
 
     result = {"project_title":plan.get("project_title") or "Director Mode sequence", "total_duration":timeline,
               "shot_count":len(prompts), "continuity_bible":bible, "global_style":plan.get("global_style") or style,
@@ -2442,6 +2609,17 @@ def oner_warnings(segments: list[str], expected: int, ref_count: int) -> list[st
     return out
 
 
+def _path_mtime_key(paths: list[str]) -> tuple[tuple[str, int], ...]:
+    out = []
+    for p in paths:
+        try:
+            mtime = Path(p).stat().st_mtime_ns
+        except OSError:
+            mtime = 0
+        out.append((p, mtime))
+    return tuple(out)
+
+
 def oner_generate(scene, frames_text, reference_files, reference_labels, style, audio, dialogue,
                   backend, ollama_url, vision_model, writer_model, tv, tw, num_ctx, keep_alive):
     cfg = load_config()
@@ -2470,11 +2648,15 @@ def oner_generate(scene, frames_text, reference_files, reference_labels, style, 
         raise ValueError("Selecciona un Writer model.")
     if is_minimax_enhancer(cfg["writer_model"]):
         raise ValueError("El enhancer de MiniMax escribe un prompt cada vez. Selecciona un modelo general como Writer.")
-    # Analyses are kept per image set, so rewriting the prompts does not re-run vision.
-    cache_key = (tuple(paths), reference_labels or "", cfg["vision_model"])
+    # Analyses are kept per image set + mtime + backend + temp, so rewriting prompts does not re-run vision.
+    cache_key = (_path_mtime_key(paths), reference_labels or "", cfg["vision_model"], backend, float(tv))
+    stats_log: list[dict] = []
+    t_oner_start = time.perf_counter()
     library = _oner_vision_cache.get(cache_key)
     if library is None:
-        library = analyze_reference_library(cfg, paths, reference_labels, tv)
+        library = analyze_reference_library(cfg, paths, reference_labels, tv, track_stats=stats_log)
+        if len(_oner_vision_cache) >= _MAX_MEMORY_CACHE:
+            del _oner_vision_cache[next(iter(_oner_vision_cache))]
         _oner_vision_cache[cache_key] = library
     frames = [align_h3_frames(v) for v in requested]
     segment_lines = "\n".join(f"Segment {i}: {f} frames ({f / 24:.2f} s)" for i, f in enumerate(frames, 1))
@@ -2483,14 +2665,16 @@ def oner_generate(scene, frames_text, reference_files, reference_labels, style, 
                    f"REFERENCE IMAGES:\n{pictures}\n\nSTYLE:\n{style or 'Decide from the brief and images.'}\n\n"
                    f"AUDIO:\n{audio or 'Decide from the brief.'}\n\nDIALOGUE:\n{dialogue or 'None.'}")
     max_tokens = max(int(cfg.get("max_tokens") or 4096), len(frames) * 1200)
-    raw = ollama_chat(cfg, cfg["writer_model"], [{"role": "system", "content": ONER_SYSTEM}, {"role": "user", "content": user_prompt}], tw, max_tokens=max_tokens)
+    raw = ollama_chat(cfg, cfg["writer_model"], [{"role": "system", "content": ONER_SYSTEM}, {"role": "user", "content": user_prompt}], tw, track_stats=stats_log, max_tokens=max_tokens)
     if keep_alive == "0m":
-        ollama_unload_all(cfg["ollama_url"])
+        ollama_unload_all(cfg["ollama_url"], backend=cfg.get("backend", "ollama"))
+    t_oner = time.perf_counter() - t_oner_start
     segments = parse_oner_segments(raw)
     if not segments:
         raise ValueError(f"La salida del modelo no tiene marcadores de segmento: {raw.strip()[:200]}")
     warnings = oner_warnings(segments, len(frames), len(paths))
-    status = f"⚠️ {'; '.join(warnings)}" if warnings else f"OK: {len(segments)} segmentos, {','.join(map(str, frames))} frames"
+    base_status = f"⚠️ {'; '.join(warnings)}" if warnings else f"OK: {len(segments)} segmentos, {','.join(map(str, frames))} frames"
+    status = f"{base_status} (⏱️ {t_oner:.1f}s)"
     return segments[0], "\n|||\n".join(segments[1:]), ",".join(map(str, frames)), status
 
 
@@ -2610,6 +2794,317 @@ def load_oner(name: Optional[str]):
     form_outputs = tuple(form.get(f, gr.update()) for f in ONER_FORM_FIELDS)
     return ((main, sections, final_frames, status, refs, ref_gallery_items(refs), None,
              gr.update(interactive=False, value="🗑️ Eliminar seleccionada")) + form_outputs)
+
+
+# ---- H3 Image: MiniMax-H3-Image prompts written with MiniMax's h3-image-prompt-writing skill ----
+# The skill is downloaded on first use into skills/ (gitignored: it is under the MiniMax-H3-Image
+# Community License, so it is fetched from MiniMax rather than redistributed with this repo).
+H3I_SKILL_DIR = ROOT / "skills" / "h3-image-prompt-writing"
+_H3I_RAW = "https://raw.githubusercontent.com/MiniMax-AI/MiniMax-H3-Image/main/"
+H3I_SKILL_FILES = {
+    "SKILL.md": _H3I_RAW + "skills/h3-image-prompt-writing/SKILL.md",
+    "references/t2i-en.txt": _H3I_RAW + "skills/h3-image-prompt-writing/references/t2i-en.txt",
+    "references/edit-en.txt": _H3I_RAW + "skills/h3-image-prompt-writing/references/edit-en.txt",
+    "LICENSE": _H3I_RAW + "LICENSE",
+}
+H3I_MAX_REFS = 16  # MiniMax-H3-Image editing accepts up to 16 images.
+H3I_ASPECTS = ["Auto", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9", "9:21", "3:1", "1:3"]
+H3I_DIR = ROOT / "outputs" / "h3_image"
+H3I_API_DEFAULT = "https://api.minimax.io"
+H3I_VISION_SYSTEM = """You are a forensic visual analyst preparing a source image for image editing. Describe only what is visible. Do not guess hidden parts, unreadable text, exact color codes or unfamiliar identities. Return valid JSON only with keys: image_type, layout, subjects (each with position such as left/right/foreground, count, appearance, colors, materials, pose or state), background, lighting, style, visible_text (every clearly readable line transcribed exactly, with its position; [] if none), ambiguities."""
+H3I_PREAMBLE = """You run MiniMax's h3-image-prompt-writing skill inside a prompt studio. Follow the skill and the guide below exactly.
+{image_note}
+Never ask questions, explain, or mention rendering or API keys. Fill ordinary gaps yourself.
+
+OUTPUT FORMAT (this replaces the skill's markdown output format):
+- Write the prompt as plain text, with no code fences, headings or commentary.
+- End each prompt with a final line exactly: Aspect ratio: W:H
+- When several options are requested, put a line === OPTION N === before each option."""
+H3I_NOTE_ANALYSIS = "You cannot see the input images. Each <Picture N> comes with its pixel size and a written analysis by a vision model: treat the analysis as what the image shows and do not add details it does not support."
+H3I_NOTE_IMAGES = "The input images are attached to the request in <Picture N> order. Look at every one of them before writing."
+H3I_NOTE_T2I = "There are no input images: this is text-to-image."
+_h3i_vision_cache: Dict[Any, list] = {}
+
+
+def h3i_download_skill() -> str:
+    """Download (or update) the skill files from MiniMax's repository."""
+    for rel, url in H3I_SKILL_FILES.items():
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError(f"No se pudo descargar el skill ({rel}): {e}") from e
+        dest = H3I_SKILL_DIR / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(dest, r.text)
+    return f"Skill actualizado en {H3I_SKILL_DIR}"
+
+
+def h3i_skill_status() -> str:
+    path = H3I_SKILL_DIR / "SKILL.md"
+    if not path.exists():
+        return "Skill no descargado: se descargará de GitHub en el primer uso."
+    return f"Skill: {H3I_SKILL_DIR} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(path.stat().st_mtime))})"
+
+
+def h3i_skill_rules(skill_md: str) -> str:
+    """SKILL.md without its frontmatter and its rendering section (the studio renders on its own)."""
+    text = re.sub(r"\A---\n.*?\n---\n", "", skill_md or "", flags=re.S)
+    text = re.sub(r"^## Rendering the prompt\n.*?(?=^## )", "", text, flags=re.S | re.M)
+    return text.strip()
+
+
+def h3i_system_prompt(task: str, image_note: str) -> str:
+    guide = "references/edit-en.txt" if task == "edit" else "references/t2i-en.txt"
+    if not all((H3I_SKILL_DIR / rel).exists() for rel in ("SKILL.md", guide)):
+        h3i_download_skill()
+    skill = h3i_skill_rules((H3I_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8"))
+    guide_text = (H3I_SKILL_DIR / guide).read_text(encoding="utf-8").strip()
+    return f"{H3I_PREAMBLE.format(image_note=image_note)}\n\n=== SKILL ===\n{skill}\n\n=== GUIDE ({guide}) ===\n{guide_text}"
+
+
+def _ratio_ok(w: int, h: int) -> bool:
+    return w > 0 and h > 0 and 1 / 3 <= w / h <= 3
+
+
+def parse_h3i_options(text: str, forced_ratio: str = "") -> list[dict]:
+    """Split writer output into [{"prompt", "ratio"}]. A ratio chosen in the UI overrides the model's."""
+    clean = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S | re.I)
+    clean = re.sub(r"^[ \t]*```[a-z]*[ \t]*$", "", clean, flags=re.M | re.I)
+    chunks = re.split(r"^[ \t]*=+[ \t]*OPTION[ \t]+\d+[ \t]*=+[ \t]*$", clean, flags=re.M | re.I)
+    options = []
+    for chunk in chunks:
+        ratio = ""
+        m = None
+        for m in re.finditer(r"^[ \t*_]*Aspect ratio[ \t*_]*:[ \t*_]*(\d+)[ \t]*[:x×/][ \t]*(\d+)[ \t*_.]*$", chunk, flags=re.M | re.I):
+            pass
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            ratio = f"{w}:{h}" if _ratio_ok(w, h) else ""
+            chunk = chunk[:m.start()] + chunk[m.end():]
+        prompt = chunk.strip()
+        if prompt:
+            options.append({"prompt": prompt, "ratio": forced_ratio or ratio or "1:1"})
+    return options
+
+
+def _h3i_size(path: str) -> str:
+    try:
+        with Image.open(path) as img:
+            from PIL import ImageOps
+            w, h = ImageOps.exif_transpose(img).size
+        return f"{w}x{h} px"
+    except Exception:
+        return "unknown size"
+
+
+def h3i_analyze_refs(cfg: Dict[str, Any], paths: list[str], temperature: float, track_stats: Optional[list] = None) -> list[dict]:
+    model = cfg.get("vision_model", "")
+    if not model:
+        raise ValueError("Has cargado imágenes: selecciona un Vision model en la pestaña principal (o marca que el Writer vea las imágenes).")
+    if model_supports_vision(cfg["ollama_url"], model, cfg.get("backend", "ollama")) is False:
+        raise ValueError(f"El modelo '{model}' no declara capacidad de Vision en Ollama.")
+    key = (_path_mtime_key(paths), model, cfg.get("backend"), float(temperature))
+    cached = _h3i_vision_cache.get(key)
+    if cached is not None:
+        return cached
+    out = []
+    for i, path in enumerate(paths, 1):
+        raw = ollama_chat(cfg, model, [
+            {"role": "system", "content": H3I_VISION_SYSTEM},
+            {"role": "user", "content": f"Analyze <Picture {i}> as a source image for an edit. Return valid JSON only.", "images": [image_to_b64(path)]},
+        ], temperature, track_stats=track_stats)
+        out.append({"tag": f"<Picture {i}>", "filename": Path(path).name, "size": _h3i_size(path), "analysis": extract_json(raw)})
+    if len(_h3i_vision_cache) >= _MAX_MEMORY_CACHE:
+        del _h3i_vision_cache[next(iter(_h3i_vision_cache))]
+    _h3i_vision_cache[key] = out
+    return out
+
+
+def h3i_generate(brief, refs, aspect, options_count, writer_sees_images,
+                 backend, ollama_url, vision_model, writer_model, tv, tw, num_ctx, keep_alive):
+    """Write MiniMax-H3-Image prompts. Returns (options, analysis_json, status)."""
+    cfg = load_config()
+    cfg.update({
+        "backend": backend,
+        "ollama_url": ollama_url.strip() or cfg["ollama_url"],
+        "vision_model": (vision_model or "").strip(),
+        "writer_model": (writer_model or "").strip(),
+        "temperature_vision": float(tv),
+        "temperature_writer": float(tw),
+        "num_ctx": int(num_ctx),
+        "keep_alive": keep_alive,
+    })
+    save_config(cfg)
+    if not (brief or "").strip():
+        raise ValueError("Describe la imagen primero.")
+    paths = [p for p in extract_paths(refs) if Path(p).exists()]
+    if len(paths) > H3I_MAX_REFS:
+        raise ValueError(f"MiniMax-H3-Image admite como máximo {H3I_MAX_REFS} imágenes.")
+    if not cfg["writer_model"]:
+        raise ValueError("Selecciona un Writer model en la pestaña principal.")
+    if is_minimax_enhancer(cfg["writer_model"]):
+        raise ValueError("El enhancer de MiniMax es para vídeo. Selecciona un modelo general como Writer.")
+    task = "edit" if paths else "t2i"
+    n = max(1, min(3, int(options_count or 1)))
+    forced = "" if aspect in (None, "", "Auto") else aspect
+    stats: list[dict] = []
+    t0 = time.perf_counter()
+    library: list[dict] = []
+    images_b64: list[str] = []
+    if not paths:
+        note = H3I_NOTE_T2I
+    elif writer_sees_images:
+        note = H3I_NOTE_IMAGES
+        images_b64 = [image_to_b64(p) for p in paths]
+    else:
+        note = H3I_NOTE_ANALYSIS
+        library = h3i_analyze_refs(cfg, paths, tv, track_stats=stats)
+    if paths:
+        pictures = "\n\n".join(
+            f"{r['tag']} ({r['filename']}, {r['size']}):\n{json.dumps(r['analysis'], ensure_ascii=False, indent=2)}" for r in library
+        ) if library else "\n".join(f"<Picture {i}> ({Path(p).name}, {_h3i_size(p)})" for i, p in enumerate(paths, 1))
+        source = f"TASK: editing with {len(paths)} input image(s), named <Picture 1> to <Picture {len(paths)}> in order.\n\nINPUT IMAGES:\n{pictures}"
+    else:
+        source = "TASK: text-to-image (no input images)."
+    ratio_line = f"Use exactly {forced}." if forced else "Choose it from the layout (between 1:3 and 3:1)."
+    user = (f"{source}\n\nREQUEST:\n{brief.strip()}\n\nASPECT RATIO: {ratio_line}\n\n"
+            f"Write {n} prompt{'s with clearly different takes' if n > 1 else ''}.")
+    message = {"role": "user", "content": user}
+    if images_b64:
+        message["images"] = images_b64
+    max_tokens = max(int(cfg.get("max_tokens") or 4096), n * 1500)
+    raw = ollama_chat(cfg, cfg["writer_model"], [{"role": "system", "content": h3i_system_prompt(task, note)}, message],
+                      tw, track_stats=stats, max_tokens=max_tokens)
+    if keep_alive == "0m":
+        ollama_unload_all(cfg["ollama_url"], backend=cfg.get("backend", "ollama"))
+    options = parse_h3i_options(raw, forced)
+    if not options:
+        raise ValueError(f"El modelo no devolvió ningún prompt: {raw.strip()[:200]}")
+    warnings = []
+    if len(options) != n:
+        warnings.append(f"se pedían {n} opciones y llegaron {len(options)}")
+    unknown = sorted({int(x) for o in options for x in re.findall(r"<Picture\s+(\d+)>", o["prompt"], flags=re.I) if not 1 <= int(x) <= len(paths)})
+    if unknown:
+        warnings.append(f"cita imágenes que no existen ({', '.join(map(str, unknown))})")
+    kind = f"edición con {len(paths)} imágenes" if paths else "texto a imagen"
+    status = (f"⚠️ {'; '.join(warnings)}" if warnings else f"OK: {len(options)} prompt(s), {kind}") + f" (⏱️ {time.perf_counter() - t0:.1f}s)"
+    analysis = json.dumps(library, ensure_ascii=False, indent=2) if library else ""
+    return options, analysis, status
+
+
+def h3i_option_choices(options: list[dict]) -> list[tuple[str, int]]:
+    return [(f"Opción {i} · {o.get('ratio', '')} · {' '.join(o.get('prompt', '').split())[:50]}…", i - 1) for i, o in enumerate(options or [], 1)]
+
+
+def _h3i_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"):
+            return "image/heic"
+        if brand in (b"mif1", b"msf1"):
+            return "image/heif"
+    return None
+
+
+def h3i_save_png(data: bytes, dest: Path, workflow: Dict[str, Any]) -> None:
+    """Save as PNG with the prompt and the full request workflow embedded as text chunks."""
+    from PIL.PngImagePlugin import PngInfo
+    info = PngInfo()
+    info.add_text("prompt", str(workflow.get("prompt", "")))
+    info.add_text("workflow", json.dumps(workflow, ensure_ascii=False))
+    with Image.open(io.BytesIO(data)) as img:
+        img.save(dest, format="PNG", pnginfo=info)
+
+
+def h3i_render(prompt, ratio, refs, area, n, enhance, brief="", writer_model="", vision_model=""):
+    """Render the prompt through the MiniMax API. Returns (image paths, status)."""
+    settings = load_local_settings()
+    key = os.environ.get("MINIMAX_API_KEY") or str(settings.get("minimax_api_key") or "")
+    if not key:
+        raise ValueError("Define MINIMAX_API_KEY (o minimax_api_key en ~/.config/h3ps/settings.json) para renderizar.")
+    base = sanitize_url(os.environ.get("MINIMAX_API_BASE") or settings.get("minimax_api_base") or H3I_API_DEFAULT,
+                        default=H3I_API_DEFAULT)
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("Genera o escribe un prompt primero.")
+    ratio = (ratio or "").strip()
+    m = re.fullmatch(r"(\d+)\s*:\s*(\d+)", ratio)
+    if ratio and not (m and _ratio_ok(int(m.group(1)), int(m.group(2)))):
+        raise ValueError("Aspect ratio debe ser W:H entre 1:3 y 3:1, por ejemplo 16:9.")
+    paths = [p for p in extract_paths(refs) if Path(p).exists()]
+    body: Dict[str, Any] = {"model": "MiniMax-H3-Image", "prompt": prompt, "n": max(1, min(10, int(n or 1))),
+                            "area": area or "4K", "response_format": "url", "output_format": "png"}
+    if ratio:
+        body["aspect_ratio"] = f"{m.group(1)}:{m.group(2)}"
+    images = []
+    if paths:
+        endpoint = "/v1/images/edits"
+        for p in paths:
+            data = Path(p).read_bytes()
+            mime = _h3i_mime(data)
+            if mime is None:
+                raise ValueError(f"Formato no admitido: {Path(p).name} (usa JPG, PNG, WebP, HEIC o HEIF)")
+            images.append({"image_url": f"data:{mime};base64,{base64.b64encode(data).decode()}"})
+    else:
+        endpoint = "/v1/images/generations"
+        if not enhance:
+            if not ratio:
+                raise ValueError("Indica un aspect ratio, o activa el enhance de la API para que lo elija ella.")
+            body["disable_prompt_enhanced"] = True
+    t0 = time.perf_counter()
+    try:
+        r = requests.post(base + endpoint, json={**body, **({"images": images} if images else {})},
+                          headers={"Authorization": f"Bearer {key}"}, timeout=900)
+    except requests.RequestException as e:
+        raise RuntimeError(f"No se pudo conectar con {base}: {e}") from e
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        result = r.json()
+    except ValueError:
+        raise RuntimeError("La API devolvió una respuesta que no es JSON.") from None
+    status_resp = result.get("base_resp") or {}
+    if status_resp.get("status_code"):
+        raise RuntimeError(f"Error de la API {status_resp.get('status_code')}: {status_resp.get('status_msg')}")
+    items = result.get("data") or []
+    if not items:
+        raise RuntimeError(f"La API no devolvió imágenes: {json.dumps(result)[:300]}")
+    H3I_DIR.mkdir(parents=True, exist_ok=True)
+    stem = f"h3_image_{time.strftime('%Y%m%d_%H%M%S')}"
+    workflow = {
+        "tool": "MiniMax H3 Prompt Studio · H3 Image", "skill": "h3-image-prompt-writing",
+        "endpoint": base + endpoint, "request": {**body, "images": [Path(p).name for p in paths]},
+        "prompt": prompt, "brief": brief or "", "writer_model": writer_model or "", "vision_model": vision_model or "",
+        "request_id": result.get("request_id"),
+    }
+    saved, failed = [], []
+    for i, item in enumerate(items, 1):
+        if item.get("error") or not item.get("url"):
+            failed.append(f"imagen {i}: {item.get('error') or 'sin URL'}")
+            continue
+        try:
+            dl = requests.get(item["url"], timeout=300)
+            dl.raise_for_status()
+            dest = H3I_DIR / f"{stem}_{i}.png"
+            meta = {**workflow, "index": i, "size": item.get("size"), "revised_prompt": item.get("revised_prompt") or ""}
+            h3i_save_png(dl.content, dest, meta)
+            _atomic_write_text(dest.with_suffix(".json"), json.dumps(meta, indent=2, ensure_ascii=False))
+            saved.append(str(dest))
+        except Exception as e:
+            failed.append(f"imagen {i}: {e}")
+    if not saved:
+        raise RuntimeError("; ".join(failed) or "No se guardó ninguna imagen.")
+    status = f"OK: {len(saved)} imagen(es) en {H3I_DIR} (⏱️ {time.perf_counter() - t0:.1f}s)"
+    if failed:
+        status += f" · ⚠️ {'; '.join(failed)}"
+    return saved, status
 
 
 # Reference thumbnails show the whole image: margin around it, and extra room below for the caption badge.
@@ -2881,6 +3376,50 @@ def build_ui():
                     o_sections = gr.Textbox(label="Section Prompts (segments 2+)", lines=16, buttons=["copy"], value=ui_state.get("o_sections", ""))
                     o_final_frames = gr.Textbox(label="Final frames: first value to Text2Video Frames, all of them to Section Durations", interactive=False, buttons=["copy"], value=ui_state.get("o_final_frames", ""))
 
+        with gr.Tab("H3 Image"):
+            gr.Markdown("## H3 Image\nPrompts for **MiniMax-H3-Image**: text-to-image, or editing with up to 16 reference images. "
+                        "Written with MiniMax's [`h3-image-prompt-writing`](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills) skill, "
+                        "using the Vision and Writer models selected in the main tab. Powered by MiniMax-H3-Image.")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    h_brief = gr.Textbox(label="Idea, brief or existing prompt", lines=6, value=ui_state.get("h_brief", ""),
+                                         placeholder="A 3:4 poster for a night market in the rain, titled \"雨夜集市\"… With images: what to change, combine or borrow.")
+                    saved_h_items = [p for p in ui_state.get("h_ref_state", []) if Path(p).exists()]
+                    h_ref_state = gr.State(saved_h_items)
+                    h_selected_ref_idx = gr.State(None)
+                    h_file = gr.File(label="Input images for editing (optional; the order sets <Picture N>, max 16)", file_count="multiple", file_types=["image"], type="filepath")
+                    h_refs = gr.Gallery(label="Input images (click one to select and delete)", columns=4, height=REF_GALLERY_HEIGHT, object_fit="contain",
+                                        elem_classes="ref-gallery", type="filepath", interactive=True, value=ref_gallery_items(saved_h_items, tagged=True))
+                    with gr.Row():
+                        h_remove_selected = gr.Button("🗑️ Eliminar seleccionada", size="sm", interactive=False)
+                        h_clear_refs = gr.Button("🧹 Borrar todas las imágenes", size="sm", variant="secondary")
+                    with gr.Row():
+                        h_aspect = gr.Dropdown(H3I_ASPECTS, value=ui_state.get("h_aspect", "Auto"), label="Aspect ratio")
+                        h_options_count = gr.Dropdown([1, 2, 3], value=ui_state.get("h_options_count", 1), label="Options")
+                    h_writer_sees = gr.Checkbox(value=ui_state.get("h_writer_sees", False), label="Send the images to the Writer (multimodal writer; skips the Vision analysis)")
+                    h_generate = gr.Button("Generate image prompt", variant="primary", size="lg")
+                    with gr.Accordion("Render with the MiniMax API", open=False):
+                        gr.Markdown("Needs `MINIMAX_API_KEY` in the environment (or `minimax_api_key` in `~/.config/h3ps/settings.json`); "
+                                    "China platform: `MINIMAX_API_BASE=https://api.minimax.cn`. PNGs go to `outputs/h3_image/` with the full request embedded as metadata.")
+                        with gr.Row():
+                            h_area = gr.Dropdown(["4K", "2K", "1K"], value=ui_state.get("h_area", "4K"), label="Area")
+                            h_n = gr.Slider(1, 4, value=ui_state.get("h_n", 1), step=1, label="Images")
+                        h_enhance = gr.Checkbox(value=ui_state.get("h_enhance", False), label="Let the API expand the prompt (text-to-image; edits are always expanded)")
+                        h_render = gr.Button("Render image", variant="secondary")
+                    with gr.Row():
+                        h_skill_update = gr.Button("🔄 Update skill from GitHub", size="sm")
+                    h_skill_info = gr.Textbox(label="Skill", interactive=False, value=h3i_skill_status())
+                with gr.Column(scale=1):
+                    h_status = gr.Textbox(label="Status", interactive=False, value=ui_state.get("h_status", ""))
+                    saved_h_options = ui_state.get("h_options", []) if isinstance(ui_state.get("h_options"), list) else []
+                    h_options_state = gr.State(saved_h_options)
+                    h_option_sel = gr.Dropdown(choices=h3i_option_choices(saved_h_options), value=0 if saved_h_options else None, label="Option", interactive=True)
+                    h_prompt = gr.Textbox(label="H3 Image prompt (editable)", lines=14, buttons=["copy"], value=ui_state.get("h_prompt", ""))
+                    h_ratio = gr.Textbox(label="Aspect ratio (W:H)", value=ui_state.get("h_ratio", ""), buttons=["copy"])
+                    h_gallery = gr.Gallery(label="Rendered images", columns=2, height=REF_GALLERY_HEIGHT, object_fit="contain", interactive=False)
+                    with gr.Accordion("Vision analysis of the input images", open=False):
+                        h_analysis = gr.Code(language="json", lines=10, value="")
+
         def on_mode_change(m):
             if m == "FLF2VA":
                 return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
@@ -2981,7 +3520,7 @@ def build_ui():
         btn_evolve_copy.click(None, inputs=evolve_output, outputs=evolve_output, js=evolve_copy_js)
 
         restore.click(restore_history, inputs=history,
-            outputs=[scene, prompt, analysis, mode, duration, aspect, preset, style, camera, motion, audio, dialogue, constraints, motion_enabled, motion_plan, title, timing_display])
+            outputs=[scene, prompt, analysis, mode, duration, aspect, preset, style, camera, motion, audio, dialogue, constraints, negative, motion_enabled, motion_plan, title, timing_display])
         compare.click(compare_history, inputs=[compare_a, compare_b], outputs=comparison)
         def clear_hist():
             save_history([])
@@ -3133,26 +3672,26 @@ def build_ui():
             image_comp.change(_image_label_updater(base_label), inputs=image_comp, outputs=image_comp, show_progress="hidden")
 
         # Persist whenever R2V references are added or removed.
-        def append_r2v_refs_and_save(single_img, ff, fl, old_r2v_state, new_files, current_list, *rest):
+        def append_r2v_refs_and_save(single_img, ff, fl, current_list, new_files, *rest):
             updated, gallery_items, _, info_md, _, btn_update = append_r2v_refs(new_files, current_list)
             args = (single_img, ff, fl, updated) + rest
             _save_main_from_inputs(*args)
             return updated, gallery_items, None, info_md, None, btn_update
-        r2v_file.change(append_r2v_refs_and_save, inputs=main_inputs_for_save[:3] + [r2v_state, r2v_file, r2v_state] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
+        r2v_file.change(append_r2v_refs_and_save, inputs=main_inputs_for_save[:3] + [r2v_state, r2v_file] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
 
-        def remove_selected_r2v_and_save(single_img, ff, fl, old_r2v_state, selected_idx, current_list, *rest):
+        def remove_selected_r2v_and_save(single_img, ff, fl, current_list, selected_idx, *rest):
             updated, gallery_items, _, info_md, _, btn_update = remove_selected_r2v(selected_idx, current_list)
             args = (single_img, ff, fl, updated) + rest
             _save_main_from_inputs(*args)
             return updated, gallery_items, None, info_md, None, btn_update
-        r2v_remove_btn.click(remove_selected_r2v_and_save, inputs=main_inputs_for_save[:3] + [r2v_state, r2v_selected_idx, r2v_state] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
+        r2v_remove_btn.click(remove_selected_r2v_and_save, inputs=main_inputs_for_save[:3] + [r2v_state, r2v_selected_idx] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
 
-        def clear_all_r2v_and_save(single_img, ff, fl, old_r2v_state, *rest):
+        def clear_all_r2v_and_save(single_img, ff, fl, *rest):
             updated, gallery_items, _, info_md, _, btn_update = clear_all_r2v()
             args = (single_img, ff, fl, updated) + rest
             _save_main_from_inputs(*args)
             return updated, gallery_items, None, info_md, None, btn_update
-        r2v_clear_btn.click(clear_all_r2v_and_save, inputs=main_inputs_for_save[:3] + [r2v_state] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
+        r2v_clear_btn.click(clear_all_r2v_and_save, inputs=main_inputs_for_save[:3] + main_inputs_for_save[4:], outputs=[r2v_state, r2v_gallery, r2v_file, r2v_tags_info, r2v_selected_idx, r2v_remove_btn])
 
         # Video reference persistence.
         r2v_video_enabled.change(_save_main_from_inputs, inputs=main_inputs_for_save)
@@ -3265,6 +3804,65 @@ def build_ui():
                               o_scene, o_frames, o_ref_labels, o_style, o_audio, o_dialogue])
         app.load(refresh_oner_selector, outputs=o_saved_selector)
 
+        # ---- H3 Image ----
+        h_save_fields = [h_brief, h_ref_state, h_aspect, h_options_count, h_writer_sees, h_area, h_n, h_enhance, h_prompt, h_ratio]
+        h_save_keys = ["h_brief", "h_ref_state", "h_aspect", "h_options_count", "h_writer_sees", "h_area", "h_n", "h_enhance", "h_prompt", "h_ratio"]
+        def _save_h3i(*values):
+            save_main_ui_state(dict(zip(h_save_keys, values)))
+        no_selection = gr.update(interactive=False, value="🗑️ Eliminar seleccionada")
+        h_refs_outputs = [h_ref_state, h_refs, h_file, h_selected_ref_idx, h_remove_selected]
+
+        def append_h_refs(new_files, current):
+            updated = list(current or [])
+            for p in extract_paths(new_files):
+                if p and p not in updated and len(updated) < H3I_MAX_REFS:
+                    updated.append(p)
+            return updated, ref_gallery_items(updated, tagged=True), None, None, no_selection
+
+        def on_h_selected(current, evt: gr.SelectData):
+            idx = evt.index
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(current or []):
+                return int(idx), gr.update(interactive=True, value=f"🗑️ Eliminar <Picture {int(idx) + 1}> ({Path(current[int(idx)]).name})")
+            return None, no_selection
+
+        def remove_h_ref(idx, current):
+            updated = list(current or [])
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(updated):
+                updated.pop(int(idx))
+            return updated, ref_gallery_items(updated, tagged=True), None, None, no_selection
+
+        h_file.upload(append_h_refs, inputs=[h_file, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_refs.upload(append_h_refs, inputs=[h_refs, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_refs.select(on_h_selected, inputs=[h_ref_state], outputs=[h_selected_ref_idx, h_remove_selected])
+        h_remove_selected.click(remove_h_ref, inputs=[h_selected_ref_idx, h_ref_state], outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        h_clear_refs.click(lambda: ([], [], None, None, no_selection), outputs=h_refs_outputs).then(_save_h3i, inputs=h_save_fields)
+        for comp in (h_brief, h_aspect, h_options_count, h_writer_sees, h_area, h_n, h_enhance, h_prompt, h_ratio):
+            comp.change(_save_h3i, inputs=h_save_fields)
+
+        def run_h3i(*args):
+            options, analysis_json, status = h3i_generate(*args)
+            first = options[0]
+            save_main_ui_state({"h_options": options, "h_prompt": first["prompt"], "h_ratio": first["ratio"], "h_status": status})
+            return (options, gr.update(choices=h3i_option_choices(options), value=0), first["prompt"], first["ratio"], analysis_json, status)
+        h_generate.click(run_h3i,
+            inputs=[h_brief, h_ref_state, h_aspect, h_options_count, h_writer_sees,
+                    backend_sel, ollama_url, vision_model, writer_model, temperature_vision, temperature_writer, num_ctx, keep_alive],
+            outputs=[h_options_state, h_option_sel, h_prompt, h_ratio, h_analysis, h_status]).then(lambda: h3i_skill_status(), outputs=h_skill_info)
+
+        def pick_h_option(idx, options):
+            if isinstance(idx, (int, float)) and 0 <= int(idx) < len(options or []):
+                return options[int(idx)]["prompt"], options[int(idx)]["ratio"]
+            return gr.update(), gr.update()
+        h_option_sel.input(pick_h_option, inputs=[h_option_sel, h_options_state], outputs=[h_prompt, h_ratio])
+
+        def run_h3i_render(*args):
+            paths, status = h3i_render(*args)
+            save_main_ui_state({"h_status": status})
+            return paths, status
+        h_render.click(run_h3i_render, inputs=[h_prompt, h_ratio, h_ref_state, h_area, h_n, h_enhance, h_brief, writer_model, vision_model],
+                       outputs=[h_gallery, h_status])
+        h_skill_update.click(lambda: f"{h3i_download_skill()} · {h3i_skill_status()}", outputs=h_skill_info)
+
     return app
 
 
@@ -3286,7 +3884,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
-    parser.add_argument("--auto-port", action="store_true", default=True, help="Find the next free port when the requested port is busy.")
+    parser.add_argument("--auto-port", action=argparse.BooleanOptionalAction, default=True, help="Find the next free port when the requested port is busy.")
     args = parser.parse_args()
     app = build_ui()
     port = find_free_port(args.host, args.port) if args.auto_port else args.port
